@@ -11,7 +11,7 @@ UWIQA
 SAUD
   100 raw images × 10 UIE methods = 1000 enhanced images
   BT scores in sub_bt_scores.mat (Bradley-Terry, unbounded)
-  Split: 800 train / 200 test (per EDANet paper)
+  Split: 800 train / 200 test
   For ranking loss: pairs of enhanced images from the same raw
 
 Both datasets use the same Dataset class interface.
@@ -239,7 +239,7 @@ def make_saud_splits(
 ) -> Tuple[List[int], List[int]]:
     """
     Returns (train_indices, test_indices) for SAUD.
-    800/200 split (per EDANet paper), seed-controlled.
+    800/200 split, seed-controlled.
     """
     mat = scipy.io.loadmat(bt_scores_mat)
     n = len(mat["sub_bt_scores"])

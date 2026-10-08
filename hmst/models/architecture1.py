@@ -105,7 +105,7 @@ class HMST(nn.Module):
         self.num_patches = self.patch_extractor.num_patches  # [49, 9, 1]
 
         # ── Backbone: ResNet-50 (shared, pretrained ImageNet) ─────────────
-        # Per §4.3 / EDANet baseline: ResNet-50 shared backbone
+        # ResNet-50 shared backbone (§2.3 of Underwater_ideas.pdf lists ResNet as candidate)
         backbone = tv_models.resnet50(weights=tv_models.ResNet50_Weights.IMAGENET1K_V1)
         # Remove the final FC layer — keep avgpool which gives [2048]
         self.backbone = nn.Sequential(*list(backbone.children())[:-1])
@@ -196,8 +196,8 @@ class HMST(nn.Module):
         """
         B = x.shape[0]
         dbg = self.print_shapes
-
         if dbg:
+            self.print_shapes = False  # Only print shapes once to avoid spamming terminal on every batch
             print(f"\n{'='*60}")
             print(f"[HMST] Input:          {list(x.shape)}")
 
@@ -207,7 +207,7 @@ class HMST(nn.Module):
 
         if dbg:
             for s, (patches, ps) in enumerate(zip(patches_ms, self.patch_sizes)):
-                print(f"[§4.2] Scale s{s+1} p={ps:3d}: patches {list(patches.shape)}")
+                print(f"[S4.2] Scale s{s+1} p={ps:3d}: patches {list(patches.shape)}")
 
         # ── Per-scale processing ───────────────────────────────────────────
         scale_features  = []  # [B, Ns, D] Transformer outputs h_i
@@ -221,25 +221,25 @@ class HMST(nn.Module):
             f_s = self._extract_patch_features(patches)  # [B, Ns, D]
 
             if dbg:
-                print(f"[§4.3] Scale s{s+1} backbone feat: {list(f_s.shape)}")
+                print(f"[S4.3] Scale s{s+1} backbone feat: {list(f_s.shape)}")
 
             # ── §4.3  Local quality head ───────────────────────────────────
-            q_s = self.quality_head(f_s)  # [B, Ns, 1]  ∈ [0,1]
+            q_s = self.quality_head(f_s)  # [B, Ns, 1]  in [0,1]
 
             if dbg:
-                print(f"[§4.3] Scale s{s+1} quality q_i:   {list(q_s.shape)}")
+                print(f"[S4.3] Scale s{s+1} quality q_i:   {list(q_s.shape)}")
 
             # ── §4.4  Transformer cross-patch interaction ──────────────────
             h_s = self.transformer(f_s)   # [B, Ns, D]
 
             if dbg:
-                print(f"[§4.4] Scale s{s+1} Transformer h:  {list(h_s.shape)}")
+                print(f"[S4.4] Scale s{s+1} Transformer h:  {list(h_s.shape)}")
 
             # ── §4.5  Semantic importance ──────────────────────────────────
             alpha_s = self.importance_head(h_s)  # [B, Ns, 1]
 
             if dbg:
-                print(f"[§4.5] Scale s{s+1} importance α:   {list(alpha_s.shape)}")
+                print(f"[S4.5] Scale s{s+1} importance alpha: {list(alpha_s.shape)}")
 
             scale_features.append(h_s)
             scale_alphas.append(alpha_s)
@@ -261,7 +261,7 @@ class HMST(nn.Module):
             Q_regions_per_scale.append(Q_reg_s)  # [B, K]
 
             if dbg:
-                print(f"[§4.6] Scale s{s+1} Q_image: {list(Q_img_s.shape)}  "
+                print(f"[S4.6] Scale s{s+1} Q_image: {list(Q_img_s.shape)}  "
                       f"Q_regions: {list(Q_reg_s.shape)}")
 
         # ── §4.8  Scale-Adaptive Fusion ────────────────────────────────────
@@ -272,8 +272,8 @@ class HMST(nn.Module):
         )
 
         if dbg:
-            print(f"[§4.8] Q_hat (fused):   {list(Q_hat.shape)}")
-            print(f"[§4.8] λ_s (scale wts): {list(lambda_s.shape)}")
+            print(f"[S4.8] Q_hat (fused):      {list(Q_hat.shape)}")
+            print(f"[S4.8] lambda_s (scale wts): {list(lambda_s.shape)}")
             print(f"{'='*60}\n")
 
         return {

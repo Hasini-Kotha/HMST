@@ -273,7 +273,7 @@ def main():
         lambda_cons  = loss_cfg.get("lambda_cons", 0.1),
     )
 
-    # ── Optimizer (Adam, lr=1e-4 per EDANet baseline) ─────────────────────
+    # ── Optimizer (Adam, lr=1e-4) ───────────────────────────────────────────
     opt_cfg = config.get("optimizer", {})
     lr      = opt_cfg.get("lr", 1e-4)
     wd      = opt_cfg.get("weight_decay", 1e-4)
@@ -304,15 +304,16 @@ def main():
     if mode == "test":
         print(f"\n{'─'*60}")
         print("Running architecture shape validation (test mode)...")
-        model.print_shapes = True
+        model.print_shapes = False
         dummy = torch.zeros(2, 3, image_size, image_size).to(device)
         with torch.no_grad():
             out = model(dummy)
         print(f"Output Q_hat shape: {list(out['Q_hat'].shape)}")
         assert out["Q_hat"].shape == (2,), f"Expected [2], got {out['Q_hat'].shape}"
         print("Shape validation: PASS")
-        model.print_shapes = config.get("print_shapes", False)
         print(f"{'─'*60}\n")
+
+    model.print_shapes = False
 
     # ── Train ─────────────────────────────────────────────────────────────
     trainer.fit(train_loader, val_loader, resume_path=resume_path)

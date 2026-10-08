@@ -33,7 +33,7 @@ image_size: 224
 # Patch sizes (§4.2): p1=32, p2=64, p3=128
 patch_sizes: [32, 64, 128]
 
-# ── Training (EDANet baseline: 50 epochs, batch=10) ──────────
+# -- Training (50 epochs, batch=10, standard UIQA settings) --------------
 epochs:     50
 batch_size: 10
 num_workers: 4

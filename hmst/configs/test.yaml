@@ -28,7 +28,7 @@ max_train_samples: 60
 max_val_samples:   20
 max_test_samples:  20
 
-# ── Preprocessing (from §4.2, EDANet paper) ──────────────────
+# -- Preprocessing (§4.2: image resized before patch extraction) --------────
 image_size: 224   # Resize to 224×224 before patch extraction
 
 # Patch sizes (§4.2): p1=32, p2=64, p3=128
@@ -39,7 +39,7 @@ epochs:     3
 batch_size: 4
 num_workers: 0   # 0 for Windows debugging
 
-# ── Optimizer (EDANet baseline: Adam lr=1e-4) ─────────────────
+# -- Optimizer (Adam lr=1e-4, standard UIQA setting) ---------------------
 optimizer:
   name: adam
   lr: 1.0e-4
@@ -65,4 +65,4 @@ device: auto   # auto-detect CUDA → MPS → CPU
 mixed_precision: false  # Disable for test mode reliability
 
 # ── Debugging ────────────────────────────────────────────────
-print_shapes: true   # Print tensor shapes through architecture
+print_shapes: false  # Print tensor shapes through architecture

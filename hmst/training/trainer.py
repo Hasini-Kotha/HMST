@@ -35,7 +35,7 @@ from typing import Optional, Dict, Any
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 
 from training.metrics import compute_metrics, collect_predictions
 from training.checkpoint import save_checkpoint, load_checkpoint
@@ -83,7 +83,7 @@ class HMSTTrainer:
 
         # AMP scaler — only if mixed_precision and CUDA available
         self.use_amp = config.get("mixed_precision", False) and device.type == "cuda"
-        self.scaler = GradScaler() if self.use_amp else None
+        self.scaler = GradScaler("cuda") if self.use_amp else None
 
     def _train_epoch(self, dataloader: DataLoader) -> Dict[str, float]:
         """Run one training epoch."""
@@ -98,7 +98,7 @@ class HMSTTrainer:
             self.optimizer.zero_grad()
 
             if self.use_amp:
-                with autocast():
+                with autocast("cuda"):
                     output = self.model(images)
                     loss_dict = self.criterion(output, scores)
                 self.scaler.scale(loss_dict["loss"]).backward()

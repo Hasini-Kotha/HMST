@@ -4,7 +4,7 @@ data/transforms.py
 Preprocessing transforms for Architecture 1 (HMST).
 
 From the documents:
-  - EDANet baseline: image resize to 224×224
+  - Image resize to 224x224 (standard UIQA practice, §4.2)
   - Multi-scale patch extraction happens INSIDE the model (§4.2)
   - Standard ImageNet normalization for the ResNet-50 backbone
 """
