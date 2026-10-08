@@ -1,0 +1,65 @@
+# ─────────────────────────────────────────────────────────────
+# MODE 2 — FULL / SERVER
+# Trains the HMST architecture on the complete dataset.
+# Architecture is IDENTICAL to test.yaml — only data amount
+# and execution settings change.
+# ─────────────────────────────────────────────────────────────
+
+mode: full
+
+# ── Reproducibility ──────────────────────────────────────────
+seed: 42
+
+# ── Dataset ──────────────────────────────────────────────────
+# Dataset to use: uwiqa | saud
+dataset: uwiqa
+
+uwiqa:
+  image_dir:  ../UWIQA dataset/UWIQA
+  score_file: ../UWIQA dataset/IQA Value.xlsx
+
+saud:
+  benchmark_dir: ../SAUD/SAUD/Benchmark
+  bt_scores_mat: ../SAUD/SAUD/sub_bt_scores.mat
+
+# null = use all available samples
+max_train_samples: null
+max_val_samples:   null
+max_test_samples:  null
+
+# ── Preprocessing (same as test) ─────────────────────────────
+image_size: 224
+
+# Patch sizes (§4.2): p1=32, p2=64, p3=128
+patch_sizes: [32, 64, 128]
+
+# ── Training (EDANet baseline: 50 epochs, batch=10) ──────────
+epochs:     50
+batch_size: 10
+num_workers: 4
+
+# ── Optimizer ────────────────────────────────────────────────
+optimizer:
+  name: adam
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+
+scheduler: null
+
+# ── Loss weights (§4.9) ──────────────────────────────────────
+loss:
+  lambda_mos:  1.0
+  lambda_rank: 1.0
+  lambda_cons: 0.1
+
+# ── Checkpointing ────────────────────────────────────────────
+checkpoint_dir: checkpoints/full
+save_every_epoch: false  # Only save latest + best on server
+resume: true
+
+# ── Device ───────────────────────────────────────────────────
+device: auto
+mixed_precision: true   # AMP for GPU training efficiency
+
+# ── Debugging ────────────────────────────────────────────────
+print_shapes: false

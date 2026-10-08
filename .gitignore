@@ -1,0 +1,8 @@
+SAUD/
+UIED/
+UWIQA dataset/
+
+__pycache__/
+*.pyc
+
+hmst/checkpoints/

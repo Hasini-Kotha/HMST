@@ -1,0 +1,68 @@
+# ─────────────────────────────────────────────────────────────
+# MODE 1 — LOCAL / DEBUG / TEST
+# Verifies the full HMST pipeline on a small subset.
+# Architecture, preprocessing, forward pass, and losses are
+# IDENTICAL to full.yaml — only the data amount changes.
+# ─────────────────────────────────────────────────────────────
+
+mode: test
+
+# ── Reproducibility ──────────────────────────────────────────
+seed: 42
+
+# ── Dataset ──────────────────────────────────────────────────
+# Dataset to use: uwiqa | saud
+dataset: uwiqa
+
+# Paths (relative to project root or absolute)
+uwiqa:
+  image_dir:  ../UWIQA dataset/UWIQA
+  score_file: ../UWIQA dataset/IQA Value.xlsx
+
+saud:
+  benchmark_dir: ../SAUD/SAUD/Benchmark
+  bt_scores_mat: ../SAUD/SAUD/sub_bt_scores.mat
+
+# Small subset for fast local verification
+max_train_samples: 60
+max_val_samples:   20
+max_test_samples:  20
+
+# ── Preprocessing (from §4.2, EDANet paper) ──────────────────
+image_size: 224   # Resize to 224×224 before patch extraction
+
+# Patch sizes (§4.2): p1=32, p2=64, p3=128
+patch_sizes: [32, 64, 128]
+
+# ── Training ─────────────────────────────────────────────────
+epochs:     3
+batch_size: 4
+num_workers: 0   # 0 for Windows debugging
+
+# ── Optimizer (EDANet baseline: Adam lr=1e-4) ─────────────────
+optimizer:
+  name: adam
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+
+# No scheduler specified in the documents
+scheduler: null
+
+# ── Loss weights (§4.9) ──────────────────────────────────────
+# L_total = λ1·L_MOS + λ2·L_rank + λ3·L_cons
+loss:
+  lambda_mos:  1.0
+  lambda_rank: 1.0
+  lambda_cons: 0.1
+
+# ── Checkpointing ────────────────────────────────────────────
+checkpoint_dir: checkpoints/test
+save_every_epoch: true   # save epoch_NNN.pt each epoch
+resume: false
+
+# ── Device ───────────────────────────────────────────────────
+device: auto   # auto-detect CUDA → MPS → CPU
+mixed_precision: false  # Disable for test mode reliability
+
+# ── Debugging ────────────────────────────────────────────────
+print_shapes: true   # Print tensor shapes through architecture
