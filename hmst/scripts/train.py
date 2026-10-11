@@ -147,6 +147,24 @@ def build_datasets(config: dict, project_root: str):
         val_ds   = SAUDDataset(benchmark_dir, bt_mat, val_idx,   val_tf,   max_val)
         test_ds  = SAUDDataset(benchmark_dir, bt_mat, test_idx,  val_tf,   max_test)
 
+    elif dataset_name == "uied":
+        cfg = config["uied"]
+        image_dir  = make_absolute(cfg["image_dir"], project_root)
+        score_file = make_absolute(cfg["score_file"], project_root)
+
+        # Import locally to avoid top-level issues if not present
+        from data import UIEDDataset, make_uied_splits
+        
+        train_idx, test_idx = make_uied_splits(score_file, seed=seed)
+
+        val_size  = max(1, len(train_idx) // 5)
+        val_idx   = train_idx[-val_size:]
+        train_idx = train_idx[:-val_size]
+
+        train_ds = UIEDDataset(image_dir, score_file, train_idx, train_tf, max_train)
+        val_ds   = UIEDDataset(image_dir, score_file, val_idx,   val_tf,   max_val)
+        test_ds  = UIEDDataset(image_dir, score_file, test_idx,  val_tf,   max_test)
+
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
@@ -168,8 +186,12 @@ def main():
         help="Path to a checkpoint to resume from (overrides config.resume)"
     )
     parser.add_argument(
-        "--dataset", type=str, default=None, choices=["uwiqa", "saud"],
+        "--dataset", type=str, default=None, choices=["uwiqa", "saud", "uied"],
         help="Override dataset from config"
+    )
+    parser.add_argument(
+        "--iterations", type=int, default=1,
+        help="Number of iterations to run with random splits"
     )
     args = parser.parse_args()
 
@@ -192,9 +214,14 @@ def main():
         if os.path.exists(default_resume):
             resume_path = default_resume
 
-    # ── Seed ──────────────────────────────────────────────────────────────
-    seed = config.get("seed", 42)
-    set_seed(seed)
+    # ── Iterations Loop ───────────────────────────────────────────────────
+    num_iterations = getattr(args, "iterations", 1)
+    base_seed = config.get("seed", 42)
+    
+    if num_iterations > 1:
+        seed_print = f"Rolling (Base: {base_seed})"
+    else:
+        seed_print = str(base_seed) if base_seed is not None else "Random (None)"
 
     # ── Device ────────────────────────────────────────────────────────────
     device = get_device(config)
@@ -207,143 +234,188 @@ def main():
     if device.type == "cuda":
         print(f"GPU:      {torch.cuda.get_device_name(0)}")
     print(f"PyTorch:  {torch.__version__}")
-    print(f"Seed:     {seed}")
+    print(f"Seed:     {seed_print}")
 
-    # ── Datasets ──────────────────────────────────────────────────────────
-    print(f"\nBuilding datasets...")
-    train_ds, val_ds, test_ds = build_datasets(config, project_root)
+    all_metrics = []
 
-    print(f"  Train:  {len(train_ds)} samples")
-    print(f"  Val:    {len(val_ds)} samples")
-    print(f"  Test:   {len(test_ds)} samples")
+    for it in range(num_iterations):
+        iter_suffix = f"_iter{it+1}" if num_iterations > 1 else ""
+        checkpoint_dir = make_absolute(config["checkpoint_dir"] + iter_suffix, project_root)
+        output_dir = make_absolute(f"outputs/{mode}{iter_suffix}", project_root)
+        final_path = os.path.join(output_dir, "test_metrics.json")
 
-    num_workers = config.get("num_workers", 0)
-    batch_size  = config.get("batch_size", 4)
+        if num_iterations > 1 and os.path.exists(final_path):
+            print(f"\n[Trainer] Iteration {it+1} already completed. Loading metrics and skipping...")
+            import json
+            with open(final_path, "r") as f:
+                all_metrics.append(json.load(f))
+            continue
 
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=(device.type == "cuda"),
-        drop_last=(len(train_ds) > batch_size),
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=(device.type == "cuda"),
-    )
-    test_loader = DataLoader(
-        test_ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=(device.type == "cuda"),
-    )
+        if num_iterations > 1:
+            print(f"\n{'#'*60}")
+            print(f" ITERATION {it+1}/{num_iterations}")
+            print(f"{'#'*60}")
+            
+        # Predictable seed for resuming dataset splits exactly
+        iter_seed = base_seed + it if base_seed is not None else 42000 + it
+        config["seed"] = iter_seed
+        set_seed(iter_seed)
+        
+        # ── Datasets ──────────────────────────────────────────────────────────
+        print(f"\nBuilding datasets...")
+        train_ds, val_ds, test_ds = build_datasets(config, project_root)
 
-    # ── Model ─────────────────────────────────────────────────────────────
-    print(f"\nBuilding HMST model...")
-    patch_sizes  = config.get("patch_sizes", [32, 64, 128])
-    image_size   = config.get("image_size", 224)
-    print_shapes = config.get("print_shapes", False)
+        print(f"  Train:  {len(train_ds)} samples")
+        print(f"  Val:    {len(val_ds)} samples")
+        print(f"  Test:   {len(test_ds)} samples")
 
-    model = HMST(
-        image_size   = image_size,
-        patch_sizes  = patch_sizes,
-        d_model      = 512,
-        nhead        = 8,
-        nlayers      = 2,
-        n_regions    = 4,
-        dropout      = 0.1,
-        print_shapes = print_shapes,
-    ).to(device)
+        num_workers = config.get("num_workers", 0)
+        batch_size  = config.get("batch_size", 4)
 
-    total_params     = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Total parameters:     {total_params:,}")
-    print(f"  Trainable parameters: {trainable_params:,}")
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True,
+            num_workers=num_workers, pin_memory=(device.type == "cuda"),
+            drop_last=(len(train_ds) > batch_size),
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=(device.type == "cuda"),
+        )
+        test_loader = DataLoader(
+            test_ds, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=(device.type == "cuda"),
+        )
 
-    # ── Loss (§4.9) ──────────────────────────────────────────────────────
-    print(f"\nBuilding loss function...")
-    M = build_correspondence_matrix(
-        num_patches_fine   = model.num_patches[0],   # 49 (p=32)
-        num_patches_coarse = model.num_patches[2],   # 1  (p=128)
-        grid_fine          = model.grid_sizes[0],    # 7
-        grid_coarse        = model.grid_sizes[2],    # 1
-    ).to(device)
+        # ── Model ─────────────────────────────────────────────────────────────
+        print(f"\nBuilding HMST model...")
+        patch_sizes  = config.get("patch_sizes", [32, 64, 128])
+        image_size   = config.get("image_size", 224)
+        print_shapes = config.get("print_shapes", False)
 
-    loss_cfg = config.get("loss", {})
-    criterion = HMSTLoss(
-        M            = M,
-        lambda_mos   = loss_cfg.get("lambda_mos",  1.0),
-        lambda_rank  = loss_cfg.get("lambda_rank", 1.0),
-        lambda_cons  = loss_cfg.get("lambda_cons", 0.1),
-    )
+        model = HMST(
+            image_size   = image_size,
+            patch_sizes  = patch_sizes,
+            d_model      = 512,
+            nhead        = 8,
+            nlayers      = 2,
+            n_regions    = 4,
+            dropout      = 0.3,
+            print_shapes = print_shapes if it == 0 else False,
+        ).to(device)
 
-    # ── Optimizer (Adam, lr=1e-4) ───────────────────────────────────────────
-    opt_cfg = config.get("optimizer", {})
-    lr      = opt_cfg.get("lr", 1e-4)
-    wd      = opt_cfg.get("weight_decay", 1e-4)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+        if it == 0:
+            total_params     = sum(p.numel() for p in model.parameters())
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"  Total parameters:     {total_params:,}")
+            print(f"  Trainable parameters: {trainable_params:,}")
 
-    print(f"  Optimizer: Adam(lr={lr}, weight_decay={wd})")
-    print(f"  Loss weights: lambda_MOS={loss_cfg.get('lambda_mos',1.0)} "
-          f"lambda_rank={loss_cfg.get('lambda_rank',1.0)} "
-          f"lambda_cons={loss_cfg.get('lambda_cons',0.1)}")
+        # ── Loss (§4.9) ──────────────────────────────────────────────────────
+        print(f"\nBuilding loss function...")
+        M = build_correspondence_matrix(
+            num_patches_fine   = model.num_patches[0],   # 49 (p=32)
+            num_patches_coarse = model.num_patches[2],   # 1  (p=128)
+            grid_fine          = model.grid_sizes[0],    # 7
+            grid_coarse        = model.grid_sizes[2],    # 1
+        ).to(device)
 
-    # ── Trainer ───────────────────────────────────────────────────────────
-    checkpoint_dir = make_absolute(config["checkpoint_dir"], project_root)
-    output_dir = make_absolute(
-        f"outputs/{mode}", project_root
-    )
+        loss_cfg = config.get("loss", {})
+        criterion = HMSTLoss(
+            M            = M,
+            lambda_mos   = loss_cfg.get("lambda_mos",  1.0),
+            lambda_rank  = loss_cfg.get("lambda_rank", 1.0),
+            lambda_cons  = loss_cfg.get("lambda_cons", 0.1),
+        )
 
-    trainer = HMSTTrainer(
-        model          = model,
-        criterion      = criterion,
-        optimizer      = optimizer,
-        config         = config,
-        device         = device,
-        output_dir     = output_dir,
-        checkpoint_dir = checkpoint_dir,
-    )
+        # ── Optimizer ───────────────────────────────────────────────────────────
+        opt_cfg = config.get("optimizer", {})
+        opt_name = opt_cfg.get("name", "adam").lower()
+        lr      = opt_cfg.get("lr", 1e-4)
+        wd      = opt_cfg.get("weight_decay", 1e-4)
+        
+        if opt_name == "adamw":
+            optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+        else:
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
 
-    # ── Shape validation (test mode) ──────────────────────────────────────
-    if mode == "test":
-        print(f"\n{'─'*60}")
-        print("Running architecture shape validation (test mode)...")
+        # ── Trainer ───────────────────────────────────────────────────────────
+        trainer = HMSTTrainer(
+            model          = model,
+            criterion      = criterion,
+            optimizer      = optimizer,
+            config         = config,
+            device         = device,
+            output_dir     = output_dir,
+            checkpoint_dir = checkpoint_dir,
+        )
+
+        # ── Shape validation (test mode) ──────────────────────────────────────
+        if mode == "test" and it == 0:
+            print(f"\n{'─'*60}")
+            print("Running architecture shape validation (test mode)...")
+            model.print_shapes = False
+            dummy = torch.zeros(2, 3, image_size, image_size).to(device)
+            with torch.no_grad():
+                out = model(dummy)
+            print(f"Output Q_hat shape: {list(out['Q_hat'].shape)}")
+            assert out["Q_hat"].shape == (2,), f"Expected [2], got {out['Q_hat'].shape}"
+            print("Shape validation: PASS")
+            print(f"{'─'*60}\n")
+
         model.print_shapes = False
-        dummy = torch.zeros(2, 3, image_size, image_size).to(device)
-        with torch.no_grad():
-            out = model(dummy)
-        print(f"Output Q_hat shape: {list(out['Q_hat'].shape)}")
-        assert out["Q_hat"].shape == (2,), f"Expected [2], got {out['Q_hat'].shape}"
-        print("Shape validation: PASS")
-        print(f"{'─'*60}\n")
 
-    model.print_shapes = False
+        # ── Train ─────────────────────────────────────────────────────────────
+        iter_resume_path = None
+        if config.get("resume", False):
+            default_iter_resume = os.path.join(checkpoint_dir, "latest.pt")
+            if os.path.exists(default_iter_resume):
+                iter_resume_path = default_iter_resume
+                
+        if args.resume and it == 0:
+            iter_resume_path = args.resume
 
-    # ── Train ─────────────────────────────────────────────────────────────
-    trainer.fit(train_loader, val_loader, resume_path=resume_path)
+        trainer.fit(train_loader, val_loader, resume_path=iter_resume_path)
 
-    # ── Final test evaluation ─────────────────────────────────────────────
-    print(f"\n{'='*60}")
-    print("Final evaluation on test set...")
-    from training.metrics import compute_metrics, collect_predictions
+        # ── Final test evaluation ─────────────────────────────────────────────
+        print(f"\n{'='*60}")
+        print(f"Final evaluation on test set for iteration {it+1}...")
+        from training.metrics import compute_metrics, collect_predictions
 
-    best_ckpt_path = os.path.join(checkpoint_dir, "best.pt")
-    if os.path.exists(best_ckpt_path):
-        from training.checkpoint import load_checkpoint
-        load_checkpoint(best_ckpt_path, model, device=device)
-        print(f"Loaded best.pt for final evaluation")
+        best_ckpt_path = os.path.join(checkpoint_dir, "best.pt")
+        if os.path.exists(best_ckpt_path):
+            from training.checkpoint import load_checkpoint
+            load_checkpoint(best_ckpt_path, model, device=device)
+            print(f"Loaded best.pt for final evaluation")
 
-    result = collect_predictions(model, test_loader, device)
-    final_metrics = compute_metrics(result["predictions"], result["targets"])
+        result = collect_predictions(model, test_loader, device)
+        final_metrics = compute_metrics(result["predictions"], result["targets"])
+        all_metrics.append(final_metrics)
 
-    import json
-    final_path = os.path.join(output_dir, "test_metrics.json")
-    with open(final_path, "w") as f:
-        json.dump(final_metrics, f, indent=2)
+        import json
+        final_path = os.path.join(output_dir, "test_metrics.json")
+        with open(final_path, "w") as f:
+            json.dump(final_metrics, f, indent=2)
 
-    print(f"\nTest Set Results:")
-    print(f"  PLCC:  {final_metrics['plcc']:.4f}")
-    print(f"  SROCC: {final_metrics['srocc']:.4f}")
-    print(f"  KRCC:  {final_metrics['krcc']:.4f}")
-    print(f"  RMSE:  {final_metrics['rmse']:.4f}")
-    print(f"\nResults saved to: {final_path}")
-    print(f"{'='*60}\n")
+        print(f"\nTest Set Results (Iter {it+1}):")
+        print(f"  PLCC:  {final_metrics['plcc']:.4f}")
+        print(f"  SROCC: {final_metrics['srocc']:.4f}")
+        print(f"  KRCC:  {final_metrics['krcc']:.4f}")
+        print(f"  RMSE:  {final_metrics['rmse']:.4f}")
+        print(f"Results saved to: {final_path}")
+        print(f"{'='*60}\n")
+
+    if num_iterations > 1:
+        print(f"\n{'='*60}")
+        print(f"AVERAGE RESULTS ACROSS {num_iterations} ITERATIONS")
+        print(f"{'='*60}")
+        
+        avg_plcc = sum(m['plcc'] for m in all_metrics) / num_iterations
+        avg_srocc = sum(m['srocc'] for m in all_metrics) / num_iterations
+        avg_rmse = sum(m['rmse'] for m in all_metrics) / num_iterations
+        
+        print(f"  Mean PLCC:  {avg_plcc:.4f}")
+        print(f"  Mean SROCC: {avg_srocc:.4f}")
+        print(f"  Mean RMSE:  {avg_rmse:.4f}")
+        print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":

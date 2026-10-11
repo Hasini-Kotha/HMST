@@ -1,8 +1,36 @@
+# Datasets
 SAUD/
 UIED/
 UWIQA dataset/
+*.xlsx
+*.mat
 
-__pycache__/
-*.pyc
-
+# Model weights & Checkpoints (Prevents GitHub 100MB file limit errors)
+*.pt
+*.pth
+*.ckpt
+*.bin
+checkpoints/
 hmst/checkpoints/
+
+# Training Outputs & Logs (keeps repo lightweight)
+outputs/
+hmst/outputs/full*/
+wandb/
+runs/
+
+# Python cache & Environment
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+.venv
+env/
+venv/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

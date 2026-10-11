@@ -16,13 +16,13 @@ import torchvision.transforms as T
 def get_train_transforms(image_size: int = 224) -> T.Compose:
     """
     Training transforms.
-    Resize + random horizontal flip + ImageNet normalization.
-    No complex augmentation is specified in the documents,
-    so only standard augmentation is applied.
+    Resize + horizontal flip + vertical flip + small rotation + ImageNet normalization.
     """
     return T.Compose([
         T.Resize((image_size, image_size)),
-        T.RandomHorizontalFlip(),
+        T.RandomHorizontalFlip(p=0.5),
+        T.RandomVerticalFlip(p=0.5),
+        T.RandomRotation(degrees=10),
         T.ToTensor(),
         T.Normalize(
             mean=[0.485, 0.456, 0.406],

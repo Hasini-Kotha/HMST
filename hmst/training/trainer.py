@@ -77,7 +77,20 @@ class HMSTTrainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         self.training_history = []
-        self.best_metric = -float("inf")  # Best SROCC
+        
+        self.save_monitor = config.get("checkpoint", {}).get("save_best_on", "srocc")
+        self.save_mode = config.get("checkpoint", {}).get("mode", "max")
+        self.best_metric = -float("inf") if self.save_mode == "max" else float("inf")
+        
+        es_cfg = config.get("early_stopping", {})
+        self.es_monitor = es_cfg.get("monitor", "srocc")
+        self.es_mode = es_cfg.get("mode", "max")
+        self.es_patience = es_cfg.get("patience", 10)
+        self.es_min_delta = es_cfg.get("min_delta", 0.0)
+        self.es_counter = 0
+        self.best_es_metric = -float("inf") if self.es_mode == "max" else float("inf")
+        self.min_epochs = config.get("min_epochs", 0)
+
         self.start_epoch = 0
         self.epochs = config.get("epochs", 50)
 
@@ -162,7 +175,9 @@ class HMSTTrainer:
             print(f"\n[Trainer] Resuming from: {resume_path}")
             ckpt = load_checkpoint(resume_path, self.model, self.optimizer, self.device)
             self.start_epoch = ckpt["epoch"] + 1
-            self.best_metric = ckpt.get("best_metric", -float("inf"))
+            default_best = -float("inf") if self.save_mode == "max" else float("inf")
+            self.best_metric = ckpt.get("best_metric", default_best)
+            self.best_es_metric = self.best_metric  # Approximate sync on resume
             self.training_history = ckpt.get("training_history", [])
             print(f"[Trainer] Continuing from epoch {self.start_epoch}")
         else:
@@ -182,8 +197,9 @@ class HMSTTrainer:
 
             epoch_time = time.time() - epoch_start
 
-            # Primary metric: SROCC (directly optimized by L_rank)
-            primary_metric = val_metrics.get("srocc", 0.0)
+            # Metrics for checkpointing and early stopping
+            ckpt_val = val_metrics.get(self.save_monitor, 0.0)
+            es_val = val_metrics.get(self.es_monitor, 0.0)
 
             # ── Logging ────────────────────────────────────────────────────
             epoch_record = {
@@ -213,7 +229,7 @@ class HMSTTrainer:
                 f"SROCC: {val_metrics['srocc']:.4f} | "
                 f"KRCC: {val_metrics['krcc']:.4f} | "
                 f"RMSE: {val_metrics['rmse']:.4f} | "
-                f"Best SROCC: {self.best_metric:.4f} | "
+                f"Best {self.save_monitor.upper()}: {self.best_metric:.4f} | "
                 f"Time: {epoch_time:.1f}s"
             )
 
@@ -225,10 +241,39 @@ class HMSTTrainer:
                 self._save_ckpt(f"epoch_{epoch+1:03d}.pt", epoch)
 
             # ── Save best checkpoint ───────────────────────────────────────
-            if primary_metric > self.best_metric:
-                self.best_metric = primary_metric
+            is_best = False
+            if self.save_mode == "max":
+                if ckpt_val > self.best_metric:
+                    is_best = True
+            else:
+                if ckpt_val < self.best_metric:
+                    is_best = True
+                    
+            if is_best:
+                self.best_metric = ckpt_val
                 self._save_ckpt("best.pt", epoch)
-                print(f"  → New best SROCC: {self.best_metric:.4f} — saved best.pt")
+                print(f"  → New best {self.save_monitor.upper()}: {self.best_metric:.4f} — saved best.pt")
+
+            # ── Early Stopping ─────────────────────────────────────────────
+            es_improved = False
+            if self.es_mode == "max":
+                if es_val > self.best_es_metric + self.es_min_delta:
+                    es_improved = True
+            else:
+                if es_val < self.best_es_metric - self.es_min_delta:
+                    es_improved = True
+                    
+            if es_improved:
+                self.best_es_metric = es_val
+                self.es_counter = 0
+                print(f"  → {self.es_monitor.upper()} improved to {es_val:.4f}")
+            else:
+                self.es_counter += 1
+                print(f"  → {self.es_monitor.upper()} did not improve. Patience: {self.es_counter}/{self.es_patience}")
+                
+            if self.es_counter >= self.es_patience and (epoch + 1) >= self.min_epochs:
+                print(f"\n[Trainer] Early stopping triggered after {epoch + 1} epochs!")
+                break
 
         print("\n[Trainer] Training complete.")
         self._save_final_metrics(val_loader)

@@ -95,13 +95,36 @@ def load_checkpoint(
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
-    # Restore random states for reproducibility
-    if "random_state" in checkpoint:
+    # Restore random states for reproducibility.
+    # Skip when loading for inference (optimizer=None) — only model weights matter.
+    if optimizer is not None and "random_state" in checkpoint:
         rs = checkpoint["random_state"]
-        random.setstate(rs["python"])
-        np.random.set_state(rs["numpy"])
-        torch.set_rng_state(rs["torch"])
-        if torch.cuda.is_available() and "cuda" in rs:
-            torch.cuda.set_rng_state_all(rs["cuda"])
+        try:
+            random.setstate(rs["python"])
+        except Exception:
+            pass
+        try:
+            np.random.set_state(rs["numpy"])
+        except Exception:
+            pass
+        try:
+            # Cast to CPU ByteTensor — guards against dtype/device mismatch
+            # that occurs when checkpoints are moved across machines or
+            # PyTorch versions (e.g., saved on one CUDA version, loaded on another).
+            torch_state = rs["torch"]
+            if not isinstance(torch_state, torch.ByteTensor):
+                torch_state = torch_state.cpu().to(torch.uint8)
+            torch.set_rng_state(torch_state)
+        except Exception:
+            pass
+        try:
+            if torch.cuda.is_available() and "cuda" in rs:
+                cuda_states = rs["cuda"]
+                current_states = torch.cuda.get_rng_state_all()
+                # Only restore if the number of GPUs matches
+                if len(cuda_states) == len(current_states):
+                    torch.cuda.set_rng_state_all(cuda_states)
+        except Exception:
+            pass
 
     return checkpoint

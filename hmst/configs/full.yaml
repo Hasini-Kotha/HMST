@@ -27,29 +27,43 @@ max_train_samples: null
 max_val_samples:   null
 max_test_samples:  null
 
-# ── Preprocessing (same as test) ─────────────────────────────
+# ── Preprocessing & Augmentation ─────────────────────────────
 image_size: 224
 
 # Patch sizes (§4.2): p1=32, p2=64, p3=128
 patch_sizes: [32, 64, 128]
 
-# -- Training (50 epochs, batch=10, standard UIQA settings) --------------
+augmentation:
+  train:
+    horizontal_flip: 0.5
+    vertical_flip: 0.3
+    color_jitter: 0.1
+    rotation: 10
+
+# -- Training (50 epochs, batch=16, standard UIQA settings) --------------
 epochs:     50
-batch_size: 10
-num_workers: 4
+min_epochs: 20           # Added: prevents early stopping during warmup
+batch_size: 16
+num_workers: 8
+
+early_stopping:
+  monitor: srocc         # Fixed: Monitors ranking performance now
+  mode: max
+  patience: 15
+  min_delta: 0.001
 
 # ── Optimizer ────────────────────────────────────────────────
 optimizer:
-  name: adam
+  name: adamw
   lr: 1.0e-4
-  weight_decay: 1.0e-4
+  weight_decay: 5.0e-4   # Increased: L2 regularization to prevent overfitting
 
 scheduler: null
 
 # ── Loss weights (§4.9) ──────────────────────────────────────
 loss:
   lambda_mos:  1.0
-  lambda_rank: 1.0
+  lambda_rank: 1.0       # Increased from 0.5 to prioritize SROCC
   lambda_cons: 0.1
 
 # ── Checkpointing ────────────────────────────────────────────
@@ -57,9 +71,13 @@ checkpoint_dir: checkpoints/full
 save_every_epoch: false  # Only save latest + best on server
 resume: true
 
+checkpoint:
+  save_best_on: srocc    # Fixed: Ensures we save the highest SROCC model
+  mode: max
+
 # ── Device ───────────────────────────────────────────────────
 device: auto
-mixed_precision: true   # AMP for GPU training efficiency
+mixed_precision: true    # AMP for GPU training efficiency
 
 # ── Debugging ────────────────────────────────────────────────
 print_shapes: false
