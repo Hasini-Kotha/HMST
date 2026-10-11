@@ -107,21 +107,3 @@ python scripts/evaluate.py --checkpoint checkpoints/full/best.pt --mode full
 
 ---
 
-## 📤 Git Commands to Push Changes
-
-```powershell
-# 1. From workspace root
-cd "s:\SNU\5th sem\dl research"
-
-# 2. Check changed files
-git status
-
-# 3. Stage changes
-git add .
-
-# 4. Commit
-git commit -m "feat(hmst): Architecture 1 pipeline, docs, and clean training logs"
-
-# 5. Push to remote
-git push origin main
-```
