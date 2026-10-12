@@ -403,19 +403,42 @@ def main():
         print(f"Results saved to: {final_path}")
         print(f"{'='*60}\n")
 
-    if num_iterations > 1:
+    if num_iterations > 1 and len(all_metrics) > 0:
         print(f"\n{'='*60}")
-        print(f"AVERAGE RESULTS ACROSS {num_iterations} ITERATIONS")
+        print(f"BENCHMARK SUMMARY ACROSS {len(all_metrics)} ITERATIONS")
         print(f"{'='*60}")
-        
-        avg_plcc = sum(m['plcc'] for m in all_metrics) / num_iterations
-        avg_srocc = sum(m['srocc'] for m in all_metrics) / num_iterations
-        avg_rmse = sum(m['rmse'] for m in all_metrics) / num_iterations
-        
-        print(f"  Mean PLCC:  {avg_plcc:.4f}")
-        print(f"  Mean SROCC: {avg_srocc:.4f}")
-        print(f"  Mean RMSE:  {avg_rmse:.4f}")
+
+        plccs  = [m["plcc"] for m in all_metrics]
+        sroccs = [m["srocc"] for m in all_metrics]
+        krccs  = [m["krcc"] for m in all_metrics]
+        rmses  = [m["rmse"] for m in all_metrics]
+
+        med_plcc,  mean_plcc,  std_plcc  = float(np.median(plccs)),  float(np.mean(plccs)),  float(np.std(plccs))
+        med_srocc, mean_srocc, std_srocc = float(np.median(sroccs)), float(np.mean(sroccs)), float(np.std(sroccs))
+        med_krcc,  mean_krcc,  std_krcc  = float(np.median(krccs)),  float(np.mean(krccs)),  float(np.std(krccs))
+        med_rmse,  mean_rmse,  std_rmse  = float(np.median(rmses)),  float(np.mean(rmses)),  float(np.std(rmses))
+
+        print(f"  Metric       Median       Mean        Std")
+        print(f"  ---------------------------------------------")
+        print(f"  SROCC:       {med_srocc:.4f}       {mean_srocc:.4f}      (±{std_srocc:.4f})")
+        print(f"  PLCC:        {med_plcc:.4f}       {mean_plcc:.4f}      (±{std_plcc:.4f})  [4-param logistic]")
+        print(f"  KRCC:        {med_krcc:.4f}       {mean_krcc:.4f}      (±{std_krcc:.4f})")
+        print(f"  RMSE:        {med_rmse:.4f}       {mean_rmse:.4f}      (±{std_rmse:.4f})  [4-param logistic]")
         print(f"{'='*60}\n")
+
+        summary_data = {
+            "num_iterations": len(all_metrics),
+            "median": {"srocc": med_srocc, "plcc": med_plcc, "krcc": med_krcc, "rmse": med_rmse},
+            "mean":   {"srocc": mean_srocc, "plcc": mean_plcc, "krcc": mean_krcc, "rmse": mean_rmse},
+            "std":    {"srocc": std_srocc, "plcc": std_plcc, "krcc": std_krcc, "rmse": std_rmse},
+            "all_iterations": all_metrics,
+        }
+        summary_dir = make_absolute(f"outputs/{mode}", project_root)
+        os.makedirs(summary_dir, exist_ok=True)
+        summary_file = os.path.join(summary_dir, f"{num_iterations}_iterations_summary.json")
+        with open(summary_file, "w") as f:
+            json.dump(summary_data, f, indent=2)
+        print(f"Full benchmark summary saved to: {summary_file}\n")
 
 
 if __name__ == "__main__":
