@@ -35,7 +35,7 @@ from data import (
     get_val_transforms,
 )
 from models import HMST, HMSTLoss, build_correspondence_matrix
-from training import HMSTTrainer
+from training import HMSTTrainer, build_optimizer
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,6 +182,10 @@ def main():
         help="Select configs/test.yaml or configs/full.yaml"
     )
     parser.add_argument(
+        "--config", type=str, default=None,
+        help="Path to custom config YAML file (e.g. configs/uwiqa_tuned.yaml). Overrides --mode"
+    )
+    parser.add_argument(
         "--resume", type=str, default=None,
         help="Path to a checkpoint to resume from (overrides config.resume)"
     )
@@ -199,7 +203,12 @@ def main():
     project_root = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 
     # ── Config ────────────────────────────────────────────────────────────
-    config = load_config(args.mode)
+    if args.config:
+        cfg_path = args.config if os.path.isabs(args.config) else os.path.join(project_root, args.config)
+        with open(cfg_path, "r") as f:
+            config = yaml.safe_load(f)
+    else:
+        config = load_config(args.mode)
     if args.dataset:
         config["dataset"] = args.dataset
 
@@ -324,18 +333,15 @@ def main():
             lambda_mos   = loss_cfg.get("lambda_mos",  1.0),
             lambda_rank  = loss_cfg.get("lambda_rank", 1.0),
             lambda_cons  = loss_cfg.get("lambda_cons", 0.1),
+            margin       = loss_cfg.get("margin", 0.1),
         )
 
         # ── Optimizer ───────────────────────────────────────────────────────────
         opt_cfg = config.get("optimizer", {})
         opt_name = opt_cfg.get("name", "adam").lower()
-        lr      = opt_cfg.get("lr", 1e-4)
-        wd      = opt_cfg.get("weight_decay", 1e-4)
-        
-        if opt_name == "adamw":
-            optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
-        else:
-            optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+        lr      = float(opt_cfg.get("lr", 1e-4))
+        wd      = float(opt_cfg.get("weight_decay", 1e-4))
+        optimizer = build_optimizer(model, opt_name, lr=lr, weight_decay=wd, **opt_cfg)
 
         # ── Trainer ───────────────────────────────────────────────────────────
         trainer = HMSTTrainer(

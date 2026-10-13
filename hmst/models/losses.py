@@ -223,14 +223,16 @@ class HMSTLoss(nn.Module):
         lambda_mos:  float = 1.0,
         lambda_rank: float = 1.0,
         lambda_cons: float = 0.1,
+        margin:      float = 0.1,
     ):
         super().__init__()
         self.lambda_mos  = lambda_mos
         self.lambda_rank = lambda_rank
         self.lambda_cons = lambda_cons
+        self.margin      = margin
 
         self.l_mos   = MOSLoss()
-        self.l_rank  = RankingLoss(margin=0.1)
+        self.l_rank  = RankingLoss(margin=margin)
         self.l_cons  = CrossScaleConsistencyLoss(M)
 
     def forward(
