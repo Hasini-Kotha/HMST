@@ -351,7 +351,8 @@ def main():
         # ── Optimizer ───────────────────────────────────────────────────────────
         opt_cfg = config.get("optimizer", {})
         opt_name = opt_cfg.get("name", "adam").lower()
-        lr      = float(opt_cfg.get("lr", 1e-4))
+        lr        = float(opt_cfg.get("lr", 1e-4))
+        wd        = float(opt_cfg.get("weight_decay", 1e-4))
         opt_extra = {k: v for k, v in opt_cfg.items() if k not in ("name", "lr", "weight_decay")}
         optimizer = build_optimizer(model, opt_name, lr=lr, weight_decay=wd, **opt_extra)
 
