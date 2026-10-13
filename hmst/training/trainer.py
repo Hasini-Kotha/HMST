@@ -64,10 +64,12 @@ class HMSTTrainer:
         device: torch.device,
         output_dir: str,
         checkpoint_dir: str,
+        scheduler: Optional[Any] = None,
     ):
         self.model = model
         self.criterion = criterion
         self.optimizer = optimizer
+        self.scheduler = scheduler
         self.config = config
         self.device = device
         self.output_dir = Path(output_dir)
@@ -191,6 +193,9 @@ class HMSTTrainer:
 
             # Training
             train_metrics = self._train_epoch(train_loader)
+
+            if self.scheduler is not None:
+                self.scheduler.step()
 
             # Validation
             val_metrics = self._val_epoch(val_loader)

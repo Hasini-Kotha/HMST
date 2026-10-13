@@ -108,7 +108,13 @@ def build_datasets(config: dict, project_root: str):
     dataset_name = config.get("dataset", "uwiqa")
     image_size   = config.get("image_size", 224)
 
-    train_tf = get_train_transforms(image_size)
+    aug_cfg  = config.get("augmentation", {}).get("train", {})
+    train_tf = get_train_transforms(
+        image_size = image_size,
+        hflip_p    = aug_cfg.get("horizontal_flip", 0.5),
+        vflip_p    = aug_cfg.get("vertical_flip", 0.5),
+        degrees    = aug_cfg.get("rotation", 10.0),
+    )
     val_tf   = get_val_transforms(image_size)
 
     max_train = config.get("max_train_samples")
@@ -301,14 +307,20 @@ def main():
         image_size   = config.get("image_size", 224)
         print_shapes = config.get("print_shapes", False)
 
+        d_model   = int(config.get("d_model", 512))
+        nhead     = int(config.get("nhead", 8))
+        nlayers   = int(config.get("nlayers", 2))
+        dropout   = float(config.get("dropout", 0.3))
+        n_regions = int(config.get("n_regions", 4))
+
         model = HMST(
             image_size   = image_size,
             patch_sizes  = patch_sizes,
-            d_model      = 512,
-            nhead        = 8,
-            nlayers      = 2,
-            n_regions    = 4,
-            dropout      = 0.3,
+            d_model      = d_model,
+            nhead        = nhead,
+            nlayers      = nlayers,
+            n_regions    = n_regions,
+            dropout      = dropout,
             print_shapes = print_shapes if it == 0 else False,
         ).to(device)
 
@@ -340,8 +352,22 @@ def main():
         opt_cfg = config.get("optimizer", {})
         opt_name = opt_cfg.get("name", "adam").lower()
         lr      = float(opt_cfg.get("lr", 1e-4))
-        wd      = float(opt_cfg.get("weight_decay", 1e-4))
-        optimizer = build_optimizer(model, opt_name, lr=lr, weight_decay=wd, **opt_cfg)
+        opt_extra = {k: v for k, v in opt_cfg.items() if k not in ("name", "lr", "weight_decay")}
+        optimizer = build_optimizer(model, opt_name, lr=lr, weight_decay=wd, **opt_extra)
+
+        # ── Scheduler ─────────────────────────────────────────────────────────
+        sched_name = config.get("scheduler", "none")
+        scheduler = None
+        if sched_name == "cosine":
+            total_epochs = config.get("epochs", 50)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=total_epochs, eta_min=lr * 0.01
+            )
+        elif sched_name == "step":
+            total_epochs = config.get("epochs", 50)
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer, step_size=max(5, total_epochs // 3), gamma=0.5
+            )
 
         # ── Trainer ───────────────────────────────────────────────────────────
         trainer = HMSTTrainer(
@@ -352,6 +378,7 @@ def main():
             device         = device,
             output_dir     = output_dir,
             checkpoint_dir = checkpoint_dir,
+            scheduler      = scheduler,
         )
 
         # ── Shape validation (test mode) ──────────────────────────────────────
