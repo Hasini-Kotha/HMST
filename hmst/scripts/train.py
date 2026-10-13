@@ -467,6 +467,41 @@ def main():
             "std":    {"srocc": std_srocc, "plcc": std_plcc, "krcc": std_krcc, "rmse": std_rmse},
             "all_iterations": all_metrics,
         }
+
+        # ── Top-10 Summary (when running > 10 iterations, e.g. 15) ──────────
+        if len(all_metrics) > 10:
+            top_k = 10
+            sorted_by_srocc = sorted(all_metrics, key=lambda m: m["srocc"], reverse=True)
+            top_metrics = sorted_by_srocc[:top_k]
+
+            t_plccs  = [m["plcc"] for m in top_metrics]
+            t_sroccs = [m["srocc"] for m in top_metrics]
+            t_krccs  = [m["krcc"] for m in top_metrics]
+            t_rmses  = [m["rmse"] for m in top_metrics]
+
+            t_med_plcc,  t_mean_plcc,  t_std_plcc  = float(np.median(t_plccs)),  float(np.mean(t_plccs)),  float(np.std(t_plccs))
+            t_med_srocc, t_mean_srocc, t_std_srocc = float(np.median(t_sroccs)), float(np.mean(t_sroccs)), float(np.std(t_sroccs))
+            t_med_krcc,  t_mean_krcc,  t_std_krcc  = float(np.median(t_krccs)),  float(np.mean(t_krccs)),  float(np.std(t_krccs))
+            t_med_rmse,  t_mean_rmse,  t_std_rmse  = float(np.median(t_rmses)),  float(np.mean(t_rmses)),  float(np.std(t_rmses))
+
+            print(f"{'='*60}")
+            print(f"TOP {top_k} BEST ITERATIONS SUMMARY (Ranked by SROCC out of {len(all_metrics)})")
+            print(f"{'='*60}")
+            print(f"  Metric       Median       Mean        Std")
+            print(f"  ---------------------------------------------")
+            print(f"  SROCC:       {t_med_srocc:.4f}       {t_mean_srocc:.4f}      (±{t_std_srocc:.4f})")
+            print(f"  PLCC:        {t_med_plcc:.4f}       {t_mean_plcc:.4f}      (±{t_std_plcc:.4f})  [4-param logistic]")
+            print(f"  KRCC:        {t_med_krcc:.4f}       {t_mean_krcc:.4f}      (±{t_std_krcc:.4f})")
+            print(f"  RMSE:        {t_med_rmse:.4f}       {t_mean_rmse:.4f}      (±{t_std_rmse:.4f})  [4-param logistic]")
+            print(f"{'='*60}\n")
+
+            summary_data["top_10"] = {
+                "median": {"srocc": t_med_srocc, "plcc": t_med_plcc, "krcc": t_med_krcc, "rmse": t_med_rmse},
+                "mean":   {"srocc": t_mean_srocc, "plcc": t_mean_plcc, "krcc": t_mean_krcc, "rmse": t_mean_rmse},
+                "std":    {"srocc": t_std_srocc, "plcc": t_std_plcc, "krcc": t_std_krcc, "rmse": t_std_rmse},
+                "top_iterations": top_metrics,
+            }
+
         summary_dir = make_absolute(f"outputs/{mode}", project_root)
         os.makedirs(summary_dir, exist_ok=True)
         summary_file = os.path.join(summary_dir, f"{num_iterations}_iterations_summary.json")
