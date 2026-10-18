@@ -201,7 +201,7 @@ python scripts/train.py --mode test
 * **Purpose**: Verifies data loading, loss convergence, backward pass, checkpoint saving, and metric calculation.
 * **Hardware**: Runs safely on standard CPU or GPU.
 * **Runtime**: ~2 to 5 minutes.
-* **Outputs**: Checkpoints saved to `checkpoints/test/`, results to `outputs/test/test_metrics.json`.
+* **Outputs**: Checkpoints saved to `checkpoints/test/`, results to `outputs/uwiqa/test/test_metrics.json` (or `outputs/saud/test/test_metrics.json` when using SAUD).
 
 ---
 
@@ -214,7 +214,7 @@ python scripts/train.py --mode full
 
 * **Purpose**: Full model convergence for research benchmark evaluation.
 * **Hardware**: Recommended on GPU (CUDA).
-* **Outputs**: Best checkpoint saved to `checkpoints/full/best.pt`, metrics saved to `outputs/full/test_metrics.json`.
+* **Outputs**: Best checkpoint saved to `checkpoints/full/best.pt`, metrics saved under `outputs/<dataset>/full/`.
 
 ---
 

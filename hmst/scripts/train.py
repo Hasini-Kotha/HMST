@@ -99,13 +99,53 @@ def make_absolute(path: str, base: str) -> str:
     return resolved
 
 
+def get_dataset_config(config: dict):
+    """Return the selected dataset name and its validated configuration."""
+    dataset_name = config.get("dataset", "uwiqa")
+    required_fields = {
+        "uwiqa": ("image_dir", "score_file"),
+        "saud": ("benchmark_dir", "bt_scores_mat"),
+        "uied": ("image_dir", "score_file"),
+    }
+    if dataset_name not in required_fields:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+
+    dataset_config = config.get(dataset_name)
+    if not isinstance(dataset_config, dict):
+        raise ValueError(
+            f"Dataset '{dataset_name}' is selected, but its '{dataset_name}:' "
+            "configuration section is missing or invalid."
+        )
+
+    missing_fields = [
+        field for field in required_fields[dataset_name]
+        if not dataset_config.get(field)
+    ]
+    if missing_fields:
+        raise ValueError(
+            f"Dataset '{dataset_name}' configuration is missing required "
+            f"field(s): {', '.join(missing_fields)}."
+        )
+
+    return dataset_name, dataset_config
+
+
+def get_run_output_dir(project_root: str, dataset_name: str, mode: str,
+                       iteration_suffix: str = "") -> str:
+    """Keep results for each dataset in a separate output tree."""
+    return make_absolute(
+        os.path.join("outputs", dataset_name, f"{mode}{iteration_suffix}"),
+        project_root,
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Dataset construction
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_datasets(config: dict, project_root: str):
     """Build train/val/test datasets from config."""
-    dataset_name = config.get("dataset", "uwiqa")
+    dataset_name, dataset_config = get_dataset_config(config)
     image_size   = config.get("image_size", 224)
 
     aug_cfg  = config.get("augmentation", {}).get("train", {})
@@ -123,9 +163,8 @@ def build_datasets(config: dict, project_root: str):
     seed      = config.get("seed", 42)
 
     if dataset_name == "uwiqa":
-        cfg = config["uwiqa"]
-        image_dir  = make_absolute(cfg["image_dir"],  project_root)
-        score_file = make_absolute(cfg["score_file"], project_root)
+        image_dir  = make_absolute(dataset_config["image_dir"],  project_root)
+        score_file = make_absolute(dataset_config["score_file"], project_root)
 
         train_idx, test_idx = make_uwiqa_splits(image_dir, score_file, seed=seed)
 
@@ -139,9 +178,8 @@ def build_datasets(config: dict, project_root: str):
         test_ds  = UWIQADataset(image_dir, score_file, test_idx,  val_tf,   max_test)
 
     elif dataset_name == "saud":
-        cfg = config["saud"]
-        benchmark_dir = make_absolute(cfg["benchmark_dir"], project_root)
-        bt_mat        = make_absolute(cfg["bt_scores_mat"], project_root)
+        benchmark_dir = make_absolute(dataset_config["benchmark_dir"], project_root)
+        bt_mat        = make_absolute(dataset_config["bt_scores_mat"], project_root)
 
         train_idx, test_idx = make_saud_splits(bt_mat, seed=seed)
 
@@ -154,9 +192,8 @@ def build_datasets(config: dict, project_root: str):
         test_ds  = SAUDDataset(benchmark_dir, bt_mat, test_idx,  val_tf,   max_test)
 
     elif dataset_name == "uied":
-        cfg = config["uied"]
-        image_dir  = make_absolute(cfg["image_dir"], project_root)
-        score_file = make_absolute(cfg["score_file"], project_root)
+        image_dir  = make_absolute(dataset_config["image_dir"],  project_root)
+        score_file = make_absolute(dataset_config["score_file"], project_root)
 
         # Import locally to avoid top-level issues if not present
         from data import UIEDDataset, make_uied_splits
@@ -218,6 +255,7 @@ def main():
     if args.dataset:
         config["dataset"] = args.dataset
 
+    dataset_name, _ = get_dataset_config(config)
     mode = config["mode"]  # test or full
 
     # Override resume from CLI
@@ -256,15 +294,21 @@ def main():
     for it in range(num_iterations):
         iter_suffix = f"_iter{it+1}" if num_iterations > 1 else ""
         checkpoint_dir = make_absolute(config["checkpoint_dir"] + iter_suffix, project_root)
-        output_dir = make_absolute(f"outputs/{mode}{iter_suffix}", project_root)
+        output_dir = get_run_output_dir(project_root, dataset_name, mode, iter_suffix)
         final_path = os.path.join(output_dir, "test_metrics.json")
 
         if num_iterations > 1 and os.path.exists(final_path):
-            print(f"\n[Trainer] Iteration {it+1} already completed. Loading metrics and skipping...")
             import json
             with open(final_path, "r") as f:
-                all_metrics.append(json.load(f))
-            continue
+                cached_metrics = json.load(f)
+            if cached_metrics.get("dataset") == dataset_name:
+                print(f"\n[Trainer] Iteration {it+1} already completed for {dataset_name}. Loading metrics and skipping...")
+                all_metrics.append(cached_metrics)
+                continue
+            print(
+                f"\n[Trainer] Ignoring iteration {it+1} metrics without matching "
+                f"dataset metadata; rerunning."
+            )
 
         if num_iterations > 1:
             print(f"\n{'#'*60}")
@@ -422,6 +466,7 @@ def main():
 
         result = collect_predictions(model, test_loader, device)
         final_metrics = compute_metrics(result["predictions"], result["targets"])
+        final_metrics["dataset"] = dataset_name
         all_metrics.append(final_metrics)
 
         import json
@@ -502,7 +547,7 @@ def main():
                 "top_iterations": top_metrics,
             }
 
-        summary_dir = make_absolute(f"outputs/{mode}", project_root)
+        summary_dir = get_run_output_dir(project_root, dataset_name, mode)
         os.makedirs(summary_dir, exist_ok=True)
         summary_file = os.path.join(summary_dir, f"{num_iterations}_iterations_summary.json")
         with open(summary_file, "w") as f:

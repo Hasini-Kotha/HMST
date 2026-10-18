@@ -19,7 +19,13 @@ import torch
 from torch.utils.data import DataLoader
 import yaml
 
-from scripts.train import load_config, build_datasets, get_device, make_absolute, set_seed
+from scripts.train import (
+    load_config,
+    build_datasets,
+    get_device,
+    get_run_output_dir,
+    set_seed,
+)
 from models import HMST, build_correspondence_matrix
 from models.losses import HMSTLoss
 from training.checkpoint import load_checkpoint
@@ -81,13 +87,16 @@ def main():
     for split_name, loader in [("Validation", val_loader), ("Test", test_loader)]:
         result = collect_predictions(model, loader, device)
         metrics = compute_metrics(result["predictions"], result["targets"])
+        metrics["dataset"] = config.get("dataset", "uwiqa")
         print(f"\n{split_name} Metrics (n={len(result['predictions'])}):")
         print(f"  PLCC:  {metrics['plcc']:.4f}")
         print(f"  SROCC: {metrics['srocc']:.4f}")
         print(f"  KRCC:  {metrics['krcc']:.4f}")
         print(f"  RMSE:  {metrics['rmse']:.4f}")
 
-        out_dir = os.path.join(project_root, "outputs", args.mode)
+        out_dir = get_run_output_dir(
+            project_root, config.get("dataset", "uwiqa"), args.mode
+        )
         os.makedirs(out_dir, exist_ok=True)
         with open(os.path.join(out_dir, f"{split_name.lower()}_metrics.json"), "w") as f:
             json.dump(metrics, f, indent=2)
