@@ -158,6 +158,7 @@ def collect_predictions(
     model.eval()
     preds_list = []
     tgts_list = []
+    paths_list = []
 
     with torch.no_grad():
         for batch in dataloader:
@@ -169,8 +170,72 @@ def collect_predictions(
 
             preds_list.append(q_hat)
             tgts_list.append(scores)
+            if "path" in batch:
+                paths_list.extend(batch["path"])
 
-    return {
+    res = {
         "predictions": np.concatenate(preds_list),
         "targets":     np.concatenate(tgts_list),
     }
+    if paths_list:
+        res["paths"] = paths_list
+    return res
+
+
+def collect_predictions_tta(
+    model: torch.nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    device: torch.device,
+) -> Dict[str, np.ndarray]:
+    """
+    Test-Time Augmentation (TTA) inference.
+
+    Averages predictions across 4 flip views per image:
+        1. Original
+        2. Horizontal flip
+        3. Vertical flip
+        4. Horizontal + Vertical flip
+
+    Flips are quality-preserving (unlike ColorJitter/blur) so label
+    integrity is maintained. Averaging reduces single-view prediction
+    noise, improving SROCC stability across iterations.
+
+    Returns:
+        dict with 'predictions', 'targets', and optionally 'paths'
+    """
+    model.eval()
+    preds_list = []
+    tgts_list = []
+    paths_list = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            images = batch["image"].to(device)   # [B, 3, H, W]
+            scores = batch["score"].numpy()
+
+            # 4 quality-preserving views
+            views = [
+                images,                                    # original
+                torch.flip(images, dims=[3]),              # horizontal flip
+                torch.flip(images, dims=[2]),              # vertical flip
+                torch.flip(images, dims=[2, 3]),           # both flips
+            ]
+
+            # Forward pass each view, collect Q_hat
+            q_hats = torch.stack(
+                [model(v)["Q_hat"].cpu() for v in views], dim=0
+            )                                              # [4, B]
+            q_avg = q_hats.mean(dim=0).numpy()            # [B]
+
+            preds_list.append(q_avg)
+            tgts_list.append(scores)
+            if "path" in batch:
+                paths_list.extend(batch["path"])
+
+    res = {
+        "predictions": np.concatenate(preds_list),
+        "targets":     np.concatenate(tgts_list),
+    }
+    if paths_list:
+        res["paths"] = paths_list
+    return res

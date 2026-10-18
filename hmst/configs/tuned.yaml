@@ -1,0 +1,65 @@
+# ─────────────────────────────────────────────────────────────
+# UWIQA Optuna-Tuned Config (alias: tuned.yaml)
+# Best hyperparameters from Optuna optimization
+# ─────────────────────────────────────────────────────────────
+
+mode: full
+dataset: uwiqa
+seed: 42
+image_size: 224
+patch_sizes: [32, 64, 128]
+
+uwiqa:
+  image_dir:  ../UWIQA dataset/UWIQA
+  score_file: ../UWIQA dataset/IQA Value.xlsx
+
+saud:
+  benchmark_dir: ../SAUD/SAUD/Benchmark
+  bt_scores_mat: ../SAUD/SAUD/sub_bt_scores.mat
+
+max_train_samples: null
+max_val_samples:   null
+max_test_samples:  null
+
+# ── Architecture parameters from Optuna ──────────────────────
+d_model: 256
+nlayers: 3
+nhead: 4
+dropout: 0.11718134709494396
+
+# ── Training settings ────────────────────────────────────────
+epochs: 50
+min_epochs: 15
+batch_size: 4
+num_workers: 4
+
+early_stopping:
+  monitor: srocc
+  mode: max
+  patience: 20           # Increased from 15: prevents premature cutoff on noisy epochs
+  min_delta: 0.0005      # Reduced from 0.001
+
+optimizer:
+  name: adam
+  lr: 7.982234035655761e-05
+  weight_decay: 0.0004944116262447936
+
+scheduler: cosine
+
+loss:
+  lambda_mos: 1.0
+  lambda_rank: 0.7844007829283733
+  lambda_cons: 0.03847926131498144
+  margin: 0.08272520338780728
+
+checkpoint_dir: checkpoints/full
+save_every_epoch: false
+resume: false
+
+checkpoint:
+  save_best_on: srocc
+  mode: max
+
+device: auto
+mixed_precision: true
+print_shapes: false

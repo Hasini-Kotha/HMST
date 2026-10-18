@@ -15,7 +15,8 @@ hmst/checkpoints/
 
 # Training Outputs & Logs (keeps repo lightweight)
 outputs/
-hmst/outputs/full*/
+hmst/outputs/
+**/outputs/
 wandb/
 runs/
 

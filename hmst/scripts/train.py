@@ -88,7 +88,18 @@ def make_absolute(path: str, base: str) -> str:
     if os.path.exists(resolved):
         return resolved
 
-    # Fallback: check without redundant parent directory (e.g. UWIQA/UWIQA dataset -> UWIQA dataset)
+    # Fallback 1: check upward parent directories (up to 4 levels)
+    curr = base
+    for _ in range(4):
+        candidate = os.path.normpath(os.path.join(curr, path))
+        if os.path.exists(candidate):
+            return candidate
+        parent = os.path.dirname(curr)
+        if parent == curr:
+            break
+        curr = parent
+
+    # Fallback 2: check without redundant parent directory (e.g. UWIQA/UWIQA dataset -> UWIQA dataset)
     parts = path.replace("\\", "/").split("/")
     if len(parts) >= 2 and parts[-2] == "UWIQA" and "UWIQA dataset" in parts[-1]:
         alt_path = path.replace("UWIQA/UWIQA dataset", "UWIQA dataset")
@@ -203,6 +214,10 @@ def main():
         "--iterations", type=int, default=1,
         help="Number of iterations to run with random splits"
     )
+    parser.add_argument(
+        "--rolling-seeds", action="store_true", default=True,
+        help="Automatically roll seeds across iterations (enabled by default)"
+    )
     args = parser.parse_args()
 
     # ── Paths ──────────────────────────────────────────────────────────────
@@ -210,7 +225,17 @@ def main():
 
     # ── Config ────────────────────────────────────────────────────────────
     if args.config:
-        cfg_path = args.config if os.path.isabs(args.config) else os.path.join(project_root, args.config)
+        if os.path.isabs(args.config):
+            cfg_path = args.config
+        elif os.path.exists(args.config):
+            cfg_path = os.path.abspath(args.config)
+        elif os.path.exists(os.path.join(project_root, args.config)):
+            cfg_path = os.path.join(project_root, args.config)
+        elif os.path.exists(os.path.join(project_root, "configs", args.config)):
+            cfg_path = os.path.join(project_root, "configs", args.config)
+        else:
+            cfg_path = os.path.join(project_root, args.config)
+
         with open(cfg_path, "r") as f:
             config = yaml.safe_load(f)
     else:
@@ -218,7 +243,7 @@ def main():
     if args.dataset:
         config["dataset"] = args.dataset
 
-    mode = config["mode"]  # test or full
+    mode = config.get("mode", args.mode or "full")
 
     # Override resume from CLI
     resume_path = args.resume
@@ -252,18 +277,23 @@ def main():
     print(f"Seed:     {seed_print}")
 
     all_metrics = []
+    all_metrics_no_tta = []
 
     for it in range(num_iterations):
         iter_suffix = f"_iter{it+1}" if num_iterations > 1 else ""
         checkpoint_dir = make_absolute(config["checkpoint_dir"] + iter_suffix, project_root)
         output_dir = make_absolute(f"outputs/{mode}{iter_suffix}", project_root)
         final_path = os.path.join(output_dir, "test_metrics.json")
+        std_path = os.path.join(output_dir, "test_metrics_no_tta.json")
 
         if num_iterations > 1 and os.path.exists(final_path):
             print(f"\n[Trainer] Iteration {it+1} already completed. Loading metrics and skipping...")
             import json
             with open(final_path, "r") as f:
                 all_metrics.append(json.load(f))
+            if os.path.exists(std_path):
+                with open(std_path, "r") as f:
+                    all_metrics_no_tta.append(json.load(f))
             continue
 
         if num_iterations > 1:
@@ -412,7 +442,7 @@ def main():
         # ── Final test evaluation ─────────────────────────────────────────────
         print(f"\n{'='*60}")
         print(f"Final evaluation on test set for iteration {it+1}...")
-        from training.metrics import compute_metrics, collect_predictions
+        from training.metrics import compute_metrics, collect_predictions, collect_predictions_tta
 
         best_ckpt_path = os.path.join(checkpoint_dir, "best.pt")
         if os.path.exists(best_ckpt_path):
@@ -420,27 +450,103 @@ def main():
             load_checkpoint(best_ckpt_path, model, device=device)
             print(f"Loaded best.pt for final evaluation")
 
+        # ── Standard single-pass evaluation ───────────────────────────────────
         result = collect_predictions(model, test_loader, device)
         final_metrics = compute_metrics(result["predictions"], result["targets"])
-        all_metrics.append(final_metrics)
+
+        # ── TTA evaluation (4-view flip average) ──────────────────────────────
+        print(f"Running TTA evaluation (4 flip views)...")
+        result_tta = collect_predictions_tta(model, test_loader, device)
+        final_metrics_tta = compute_metrics(result_tta["predictions"], result_tta["targets"])
+
+        # Use TTA metrics as the reported result (better stability)
+        all_metrics.append(final_metrics_tta)
+        all_metrics_no_tta.append(final_metrics)
 
         import json
         final_path = os.path.join(output_dir, "test_metrics.json")
         with open(final_path, "w") as f:
+            json.dump(final_metrics_tta, f, indent=2)
+
+        # Also save standard metrics for reference
+        std_path = os.path.join(output_dir, "test_metrics_no_tta.json")
+        with open(std_path, "w") as f:
             json.dump(final_metrics, f, indent=2)
 
+        # ── Per-image predictions CSV (Actual vs Predicted analysis) ──────────
+        import csv
+        pred_csv_path = os.path.join(output_dir, "test_predictions.csv")
+        paths = result_tta.get("paths", result.get("paths", []))
+        preds_no_tta = result["predictions"]
+        preds_tta = result_tta["predictions"]
+        actuals = result_tta["targets"]
+
+        rows = []
+        for idx in range(len(actuals)):
+            full_path = paths[idx] if idx < len(paths) else f"test_{idx:04d}"
+            img_name = os.path.basename(full_path)
+            act = float(actuals[idx])
+            p_tta = float(preds_tta[idx])
+            p_raw = float(preds_no_tta[idx])
+            err_tta = p_tta - act
+            abs_err = abs(err_tta)
+            rows.append({
+                "image": img_name,
+                "actual_mos": act,
+                "pred_mos_tta": p_tta,
+                "pred_mos_no_tta": p_raw,
+                "abs_error_tta": abs_err,
+                "error_tta": err_tta,
+                "path": full_path,
+            })
+
+        with open(pred_csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["image", "actual_mos", "pred_mos_tta", "pred_mos_no_tta", "abs_error_tta", "error_tta", "path"])
+            for r in rows:
+                writer.writerow([
+                    r["image"],
+                    f"{r['actual_mos']:.4f}",
+                    f"{r['pred_mos_tta']:.4f}",
+                    f"{r['pred_mos_no_tta']:.4f}",
+                    f"{r['abs_error_tta']:.4f}",
+                    f"{r['error_tta']:.4f}",
+                    r["path"],
+                ])
+
         print(f"\nTest Set Results (Iter {it+1}):")
-        print(f"  PLCC:  {final_metrics['plcc']:.4f}")
-        print(f"  SROCC: {final_metrics['srocc']:.4f}")
-        print(f"  KRCC:  {final_metrics['krcc']:.4f}")
-        print(f"  RMSE:  {final_metrics['rmse']:.4f}")
-        print(f"Results saved to: {final_path}")
+        print(f"  {'Metric':<8}  {'No TTA':>8}  {'TTA (4-view)':>12}")
+        print(f"  {'-'*34}")
+        print(f"  {'PLCC':<8}  {final_metrics['plcc']:>8.4f}  {final_metrics_tta['plcc']:>12.4f}")
+        print(f"  {'SROCC':<8}  {final_metrics['srocc']:>8.4f}  {final_metrics_tta['srocc']:>12.4f}")
+        print(f"  {'KRCC':<8}  {final_metrics['krcc']:>8.4f}  {final_metrics_tta['krcc']:>12.4f}")
+        print(f"  {'RMSE':<8}  {final_metrics['rmse']:>8.4f}  {final_metrics_tta['rmse']:>12.4f}")
+        print(f"TTA results saved to: {final_path}")
+        print(f"Per-image predictions saved to: {pred_csv_path}")
+
+        # Quick console highlight: top 3 best and top 3 worst, plus MAE & MedAE
+        sorted_by_err = sorted(rows, key=lambda x: x["abs_error_tta"])
+        best_3 = sorted_by_err[:min(3, len(sorted_by_err))]
+        worst_3 = sorted_by_err[-min(3, len(sorted_by_err)):][::-1]
+        all_abs_errors = [r["abs_error_tta"] for r in rows]
+        mean_ae = float(np.mean(all_abs_errors))
+        med_ae = float(np.median(all_abs_errors))
+
+        print(f"\n  Per-Image Prediction Highlights (Iter {it+1}):")
+        print(f"    Mean Absolute Error (MAE):     {mean_ae:.4f}")
+        print(f"    Median Absolute Error (MedAE):  {med_ae:.4f}")
+        print(f"    Closest Predictions (Best):")
+        for b in best_3:
+            print(f"      • {b['image']:<12}: Actual={b['actual_mos']:.4f}, Pred={b['pred_mos_tta']:.4f} (Diff: {b['abs_error_tta']:.4f})")
+        print(f"    Largest Prediction Errors (Failure Cases):")
+        for w in worst_3:
+            print(f"      • {w['image']:<12}: Actual={w['actual_mos']:.4f}, Pred={w['pred_mos_tta']:.4f} (Diff: {w['abs_error_tta']:.4f})")
         print(f"{'='*60}\n")
 
     if num_iterations > 1 and len(all_metrics) > 0:
-        print(f"\n{'='*60}")
-        print(f"BENCHMARK SUMMARY ACROSS {len(all_metrics)} ITERATIONS")
-        print(f"{'='*60}")
+        print(f"\n{'='*65}")
+        print(f"BENCHMARK SUMMARY ACROSS {len(all_metrics)} ITERATIONS (Single View vs TTA)")
+        print(f"{'='*65}")
 
         plccs  = [m["plcc"] for m in all_metrics]
         sroccs = [m["srocc"] for m in all_metrics]
@@ -452,25 +558,56 @@ def main():
         med_krcc,  mean_krcc,  std_krcc  = float(np.median(krccs)),  float(np.mean(krccs)),  float(np.std(krccs))
         med_rmse,  mean_rmse,  std_rmse  = float(np.median(rmses)),  float(np.mean(rmses)),  float(np.std(rmses))
 
-        print(f"  Metric       Median       Mean        Std")
-        print(f"  ---------------------------------------------")
-        print(f"  SROCC:       {med_srocc:.4f}       {mean_srocc:.4f}      (±{std_srocc:.4f})")
-        print(f"  PLCC:        {med_plcc:.4f}       {mean_plcc:.4f}      (±{std_plcc:.4f})  [4-param logistic]")
-        print(f"  KRCC:        {med_krcc:.4f}       {mean_krcc:.4f}      (±{std_krcc:.4f})")
-        print(f"  RMSE:        {med_rmse:.4f}       {mean_rmse:.4f}      (±{std_rmse:.4f})  [4-param logistic]")
-        print(f"{'='*60}\n")
+        has_no_tta = (len(all_metrics_no_tta) == len(all_metrics))
+        if has_no_tta:
+            plccs_raw  = [m["plcc"] for m in all_metrics_no_tta]
+            sroccs_raw = [m["srocc"] for m in all_metrics_no_tta]
+            krccs_raw  = [m["krcc"] for m in all_metrics_no_tta]
+            rmses_raw  = [m["rmse"] for m in all_metrics_no_tta]
+
+            med_plcc_raw,  mean_plcc_raw,  std_plcc_raw  = float(np.median(plccs_raw)),  float(np.mean(plccs_raw)),  float(np.std(plccs_raw))
+            med_srocc_raw, mean_srocc_raw, std_srocc_raw = float(np.median(sroccs_raw)), float(np.mean(sroccs_raw)), float(np.std(sroccs_raw))
+            med_krcc_raw,  mean_krcc_raw,  std_krcc_raw  = float(np.median(krccs_raw)),  float(np.mean(krccs_raw)),  float(np.std(krccs_raw))
+            med_rmse_raw,  mean_rmse_raw,  std_rmse_raw  = float(np.median(rmses_raw)),  float(np.mean(rmses_raw)),  float(np.std(rmses_raw))
+
+            print(f"  {'Metric':<8}  {'Single View (No TTA)':<25}  {'TTA (4-view)':<25}")
+            print(f"  {'-'*62}")
+            print(f"  {'SROCC:':<8}  {med_srocc_raw:.4f} (Mean: {mean_srocc_raw:.4f}±{std_srocc_raw:.4f})   {med_srocc:.4f} (Mean: {mean_srocc:.4f}±{std_srocc:.4f})")
+            print(f"  {'PLCC:':<8}  {med_plcc_raw:.4f} (Mean: {mean_plcc_raw:.4f}±{std_plcc_raw:.4f})   {med_plcc:.4f} (Mean: {mean_plcc:.4f}±{std_plcc:.4f})")
+            print(f"  {'KRCC:':<8}  {med_krcc_raw:.4f} (Mean: {mean_krcc_raw:.4f}±{std_krcc_raw:.4f})   {med_krcc:.4f} (Mean: {mean_krcc:.4f}±{std_krcc:.4f})")
+            print(f"  {'RMSE:':<8}  {med_rmse_raw:.4f} (Mean: {mean_rmse_raw:.4f}±{std_rmse_raw:.4f})   {med_rmse:.4f} (Mean: {mean_rmse:.4f}±{std_rmse:.4f})")
+            print(f"{'='*65}\n")
+        else:
+            print(f"  Metric       Median       Mean        Std")
+            print(f"  ---------------------------------------------")
+            print(f"  SROCC:       {med_srocc:.4f}       {mean_srocc:.4f}      (±{std_srocc:.4f})")
+            print(f"  PLCC:        {med_plcc:.4f}       {mean_plcc:.4f}      (±{std_plcc:.4f})  [4-param logistic]")
+            print(f"  KRCC:        {med_krcc:.4f}       {mean_krcc:.4f}      (±{std_krcc:.4f})")
+            print(f"  RMSE:        {med_rmse:.4f}       {mean_rmse:.4f}      (±{std_rmse:.4f})  [4-param logistic]")
+            print(f"{'='*60}\n")
 
         summary_data = {
             "num_iterations": len(all_metrics),
-            "median": {"srocc": med_srocc, "plcc": med_plcc, "krcc": med_krcc, "rmse": med_rmse},
-            "mean":   {"srocc": mean_srocc, "plcc": mean_plcc, "krcc": mean_krcc, "rmse": mean_rmse},
-            "std":    {"srocc": std_srocc, "plcc": std_plcc, "krcc": std_krcc, "rmse": std_rmse},
-            "all_iterations": all_metrics,
+            "tta_4view": {
+                "median": {"srocc": med_srocc, "plcc": med_plcc, "krcc": med_krcc, "rmse": med_rmse},
+                "mean":   {"srocc": mean_srocc, "plcc": mean_plcc, "krcc": mean_krcc, "rmse": mean_rmse},
+                "std":    {"srocc": std_srocc, "plcc": std_plcc, "krcc": std_krcc, "rmse": std_rmse},
+                "all_iterations": all_metrics,
+            },
         }
+        if has_no_tta:
+            summary_data["single_view_no_tta"] = {
+                "median": {"srocc": med_srocc_raw, "plcc": med_plcc_raw, "krcc": med_krcc_raw, "rmse": med_rmse_raw},
+                "mean":   {"srocc": mean_srocc_raw, "plcc": mean_plcc_raw, "krcc": mean_krcc_raw, "rmse": mean_rmse_raw},
+                "std":    {"srocc": std_srocc_raw, "plcc": std_plcc_raw, "krcc": std_krcc_raw, "rmse": std_rmse_raw},
+                "all_iterations": all_metrics_no_tta,
+            }
 
         # ── Top-10 Summary (when running > 10 iterations, e.g. 15) ──────────
         if len(all_metrics) > 10:
             top_k = 10
+
+            # 1. Top-k for TTA
             sorted_by_srocc = sorted(all_metrics, key=lambda m: m["srocc"], reverse=True)
             top_metrics = sorted_by_srocc[:top_k]
 
@@ -484,23 +621,58 @@ def main():
             t_med_krcc,  t_mean_krcc,  t_std_krcc  = float(np.median(t_krccs)),  float(np.mean(t_krccs)),  float(np.std(t_krccs))
             t_med_rmse,  t_mean_rmse,  t_std_rmse  = float(np.median(t_rmses)),  float(np.mean(t_rmses)),  float(np.std(t_rmses))
 
-            print(f"{'='*60}")
-            print(f"TOP {top_k} BEST ITERATIONS SUMMARY (Ranked by SROCC out of {len(all_metrics)})")
-            print(f"{'='*60}")
-            print(f"  Metric       Median       Mean        Std")
-            print(f"  ---------------------------------------------")
-            print(f"  SROCC:       {t_med_srocc:.4f}       {t_mean_srocc:.4f}      (±{t_std_srocc:.4f})")
-            print(f"  PLCC:        {t_med_plcc:.4f}       {t_mean_plcc:.4f}      (±{t_std_plcc:.4f})  [4-param logistic]")
-            print(f"  KRCC:        {t_med_krcc:.4f}       {t_mean_krcc:.4f}      (±{t_std_krcc:.4f})")
-            print(f"  RMSE:        {t_med_rmse:.4f}       {t_mean_rmse:.4f}      (±{t_std_rmse:.4f})  [4-param logistic]")
-            print(f"{'='*60}\n")
-
             summary_data["top_10"] = {
-                "median": {"srocc": t_med_srocc, "plcc": t_med_plcc, "krcc": t_med_krcc, "rmse": t_med_rmse},
-                "mean":   {"srocc": t_mean_srocc, "plcc": t_mean_plcc, "krcc": t_mean_krcc, "rmse": t_mean_rmse},
-                "std":    {"srocc": t_std_srocc, "plcc": t_std_plcc, "krcc": t_std_krcc, "rmse": t_std_rmse},
-                "top_iterations": top_metrics,
+                "tta_4view": {
+                    "median": {"srocc": t_med_srocc, "plcc": t_med_plcc, "krcc": t_med_krcc, "rmse": t_med_rmse},
+                    "mean":   {"srocc": t_mean_srocc, "plcc": t_mean_plcc, "krcc": t_mean_krcc, "rmse": t_mean_rmse},
+                    "std":    {"srocc": t_std_srocc, "plcc": t_std_plcc, "krcc": t_std_krcc, "rmse": t_std_rmse},
+                    "top_iterations": top_metrics,
+                }
             }
+
+            if has_no_tta and len(all_metrics_no_tta) > 10:
+                # 2. Top-k for Single View (No TTA)
+                sorted_by_srocc_raw = sorted(all_metrics_no_tta, key=lambda m: m["srocc"], reverse=True)
+                top_metrics_raw = sorted_by_srocc_raw[:top_k]
+
+                t_plccs_raw  = [m["plcc"] for m in top_metrics_raw]
+                t_sroccs_raw = [m["srocc"] for m in top_metrics_raw]
+                t_krccs_raw  = [m["krcc"] for m in top_metrics_raw]
+                t_rmses_raw  = [m["rmse"] for m in top_metrics_raw]
+
+                t_med_plcc_raw,  t_mean_plcc_raw,  t_std_plcc_raw  = float(np.median(t_plccs_raw)),  float(np.mean(t_plccs_raw)),  float(np.std(t_plccs_raw))
+                t_med_srocc_raw, t_mean_srocc_raw, t_std_srocc_raw = float(np.median(t_sroccs_raw)), float(np.mean(t_sroccs_raw)), float(np.std(t_sroccs_raw))
+                t_med_krcc_raw,  t_mean_krcc_raw,  t_std_krcc_raw  = float(np.median(t_krccs_raw)),  float(np.mean(t_krccs_raw)),  float(np.std(t_krccs_raw))
+                t_med_rmse_raw,  t_mean_rmse_raw,  t_std_rmse_raw  = float(np.median(rmses_raw)),  float(np.mean(rmses_raw)),  float(np.std(rmses_raw))
+
+                summary_data["top_10"]["single_view_no_tta"] = {
+                    "median": {"srocc": t_med_srocc_raw, "plcc": t_med_plcc_raw, "krcc": t_med_krcc_raw, "rmse": t_med_rmse_raw},
+                    "mean":   {"srocc": t_mean_srocc_raw, "plcc": t_mean_plcc_raw, "krcc": t_mean_krcc_raw, "rmse": t_mean_rmse_raw},
+                    "std":    {"srocc": t_std_srocc_raw, "plcc": t_std_plcc_raw, "krcc": t_std_krcc_raw, "rmse": t_std_rmse_raw},
+                    "top_iterations": top_metrics_raw,
+                }
+
+                print(f"{'='*65}")
+                print(f"TOP {top_k} BEST ITERATIONS SUMMARY (Ranked by SROCC out of {len(all_metrics)})")
+                print(f"{'='*65}")
+                print(f"  {'Metric':<8}  {'Single View (No TTA)':<25}  {'TTA (4-view)':<25}")
+                print(f"  {'-'*62}")
+                print(f"  {'SROCC:':<8}  {t_med_srocc_raw:.4f} (Mean: {t_mean_srocc_raw:.4f}±{t_std_srocc_raw:.4f})   {t_med_srocc:.4f} (Mean: {t_mean_srocc:.4f}±{t_std_srocc:.4f})")
+                print(f"  {'PLCC:':<8}  {t_med_plcc_raw:.4f} (Mean: {t_mean_plcc_raw:.4f}±{t_std_plcc_raw:.4f})   {t_med_plcc:.4f} (Mean: {t_mean_plcc:.4f}±{t_std_plcc:.4f})")
+                print(f"  {'KRCC:':<8}  {t_med_krcc_raw:.4f} (Mean: {t_mean_krcc_raw:.4f}±{t_std_krcc_raw:.4f})   {t_med_krcc:.4f} (Mean: {t_mean_krcc:.4f}±{t_std_krcc:.4f})")
+                print(f"  {'RMSE:':<8}  {t_med_rmse_raw:.4f} (Mean: {t_mean_rmse_raw:.4f}±{t_std_rmse_raw:.4f})   {t_med_rmse:.4f} (Mean: {t_mean_rmse:.4f}±{t_std_rmse:.4f})")
+                print(f"{'='*65}\n")
+            else:
+                print(f"{'='*60}")
+                print(f"TOP {top_k} BEST ITERATIONS SUMMARY (Ranked by SROCC out of {len(all_metrics)})")
+                print(f"{'='*60}")
+                print(f"  Metric       Median       Mean        Std")
+                print(f"  ---------------------------------------------")
+                print(f"  SROCC:       {t_med_srocc:.4f}       {t_mean_srocc:.4f}      (±{t_std_srocc:.4f})")
+                print(f"  PLCC:        {t_med_plcc:.4f}       {t_mean_plcc:.4f}      (±{t_std_plcc:.4f})  [4-param logistic]")
+                print(f"  KRCC:        {t_med_krcc:.4f}       {t_mean_krcc:.4f}      (±{t_std_krcc:.4f})")
+                print(f"  RMSE:        {t_med_rmse:.4f}       {t_mean_rmse:.4f}      (±{t_std_rmse:.4f})  [4-param logistic]")
+                print(f"{'='*60}\n")
 
         summary_dir = make_absolute(f"outputs/{mode}", project_root)
         os.makedirs(summary_dir, exist_ok=True)

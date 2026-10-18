@@ -49,8 +49,8 @@ num_workers: 8
 early_stopping:
   monitor: srocc         # Fixed: Monitors ranking performance now
   mode: max
-  patience: 15
-  min_delta: 0.001
+  patience: 20           # Increased from 15: SROCC is noisy epoch-to-epoch (±0.02), need more patience
+  min_delta: 0.0005      # Reduced from 0.001: less aggressive threshold, avoids premature stopping
 
 # ── Optimizer ────────────────────────────────────────────────
 optimizer:

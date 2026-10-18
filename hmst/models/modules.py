@@ -327,7 +327,7 @@ class ScaleAdaptiveFusion(nn.Module):
     G_s = global representation of scale s (mean of all patch features)
     e_s = MLP(G_s)
     λ_s = softmax(e_s)
-    Q̂   = Σ_s λ_s · (Σ_i α_i^(s) · q_i^(s))
+    Q̂   = Σ_s λ_s · Σ_i α_i^(s) · q_i^(s)
 
     Args:
         d_model:   Feature dimension
@@ -345,11 +345,16 @@ class ScaleAdaptiveFusion(nn.Module):
 
     def forward(
         self,
-        scale_features: List[torch.Tensor],   # [B, Ns, D] per scale
-        scale_alphas:   List[torch.Tensor],   # [B, Ns, 1] per scale
+        scale_features:  List[torch.Tensor],  # [B, Ns, D] per scale
+        scale_alphas:    List[torch.Tensor],  # [B, Ns, 1] per scale
         scale_qualities: List[torch.Tensor],  # [B, Ns, 1] per scale
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
+        Args:
+            scale_features:  list of [B, Ns, D] — Transformer outputs h_i
+            scale_alphas:    list of [B, Ns, 1] — importance weights α_i
+            scale_qualities: list of [B, Ns, 1] — local qualities q_i
+
         Returns:
             Q_hat:       [B] — final fused quality score
             lambda_s:    [B, S] — per-scale weights (for logging)
@@ -360,22 +365,23 @@ class ScaleAdaptiveFusion(nn.Module):
 
         for s in range(S):
             h_s = scale_features[s]    # [B, Ns, D]
-            a_s = scale_alphas[s]      # [B, Ns, 1]
+            alpha_s = scale_alphas[s]  # [B, Ns, 1]
             q_s = scale_qualities[s]   # [B, Ns, 1]
 
-            # G_s = global mean of patch features for this scale
+            # G_s = global mean of patch features → drives scale attention
             G_s = h_s.mean(dim=1)      # [B, D]
             e_s = self.scale_mlp(G_s)  # [B, 1]
             e_s_list.append(e_s)
 
-            # Scale-level quality: Σ_i α_i^(s) · q_i^(s)
-            Q_s = (a_s * q_s).sum(dim=1)  # [B, 1]
+            # Per-scale quality score: weighted sum of patch qualities
+            # Q_s = Σ_i α_i · q_i
+            Q_s = (alpha_s * q_s).sum(dim=1)  # [B, 1]
             Q_s_list.append(Q_s)
 
-        e_s_t = torch.cat(e_s_list, dim=1)   # [B, S]
-        Q_s_t = torch.cat(Q_s_list, dim=1)   # [B, S]
+        e_s_t = torch.cat(e_s_list, dim=1)    # [B, S]
+        lambda_s = F.softmax(e_s_t, dim=1)    # [B, S]
 
-        lambda_s = F.softmax(e_s_t, dim=1)   # [B, S]
-        Q_hat = (lambda_s * Q_s_t).sum(dim=1)  # [B]
+        Q_s_t = torch.cat(Q_s_list, dim=1)    # [B, S]
+        Q_hat = (lambda_s * Q_s_t).sum(dim=1) # [B]
 
         return Q_hat, lambda_s

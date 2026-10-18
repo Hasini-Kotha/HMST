@@ -7,8 +7,9 @@ The primary model implemented is **HMST (Hierarchical Multi-Scale Transformer - 
 ---
 
 ## 📑 Quick Navigation
-* **Full HMST Architecture & Run Guide**: [hmst/README.md](file:///s:/SNU/5th%20sem/dl%20research/hmst/README.md)
-* **Architecture Specifications & Paper Mapping**: [solution3_architecture_analysis.md](file:///s:/SNU/5th%20sem/dl%20research/solution3_architecture_analysis.md)
+* **Complete Step-by-Step Architecture Guide (Simple English)**: [ARCHITECTURE_EXPLAINED.md](file:///c:/Users/Hasini/HMST/ARCHITECTURE_EXPLAINED.md)
+* **Full HMST Architecture & Run Guide**: [hmst/README.md](file:///c:/Users/Hasini/HMST/hmst/README.md)
+* **Architecture Specifications & Paper Mapping**: [solution3_architecture_analysis.md](file:///c:/Users/Hasini/HMST/solution3_architecture_analysis.md)
 * **Code Implementation**:
   - Model Architecture: [hmst/models/architecture1.py](file:///s:/SNU/5th%20sem/dl%20research/hmst/models/architecture1.py)
   - Core Modules: [hmst/models/modules.py](file:///s:/SNU/5th%20sem/dl%20research/hmst/models/modules.py)

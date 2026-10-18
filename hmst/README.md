@@ -5,6 +5,7 @@ Implementation of **Architecture 1** from **Solution III: Multi-Scale Transforme
 ---
 
 ## Table of Contents
+0. [📘 Complete Architecture Guide in Simple English](../ARCHITECTURE_EXPLAINED.md)
 1. [Architecture Overview & Flow (Input → Output)](#architecture-overview--flow-input--output)
 2. [Step-by-Step Mathematical Formulation](#step-by-step-mathematical-formulation)
 3. [Libraries & Dependencies](#libraries--dependencies)
