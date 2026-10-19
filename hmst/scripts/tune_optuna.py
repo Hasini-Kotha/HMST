@@ -17,10 +17,10 @@ Usage:
     python scripts/tune_optuna.py --trials 30 --epochs 25
 
     # Run with custom storage
-    python scripts/tune_optuna.py --trials 50 --storage sqlite:///outputs/optuna/uwiqa_study.db
+    python scripts/tune_optuna.py --trials 50 --storage sqlite:///outputs/uwiqa/optuna/uwiqa_study.db
 
     # Launch dashboard in browser
-    optuna-dashboard sqlite:///outputs/optuna/uwiqa_study.db
+    optuna-dashboard sqlite:///outputs/uwiqa/optuna/hmst_uwiqa_tuning.db
 """
 
 import os
@@ -386,21 +386,28 @@ def main():
     parser.add_argument("--workers", type=int, default=4, help="DataLoader num_workers")
     parser.add_argument("--seed", type=int, default=42, help="Seed for split consistency")
     parser.add_argument(
-        "--study-name", type=str, default="hmst_uwiqa_tuning",
-        help="Name of the Optuna study"
+        "--study-name", type=str, default=None,
+        help="Name of the Optuna study (default: hmst_<dataset>_tuning)"
     )
     parser.add_argument(
         "--storage", type=str, default=None,
-        help="Storage URL (default: sqlite:///outputs/optuna/uwiqa_study.db)"
+        help="Storage URL (default: sqlite:///outputs/<dataset>/optuna/<study>.db)"
     )
     parser.add_argument(
-        "--output-config", type=str, default="configs/uwiqa_tuned.yaml",
-        help="Path where the best config YAML will be written"
+        "--output-config", type=str, default=None,
+        help="Path where the best config YAML will be written (default: configs/<dataset>_tuned.yaml)"
     )
     args = parser.parse_args()
 
     project_root = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
-    optuna_dir = os.path.join(project_root, "outputs", "optuna")
+    dataset = args.dataset
+    if args.study_name is None:
+        args.study_name = f"hmst_{dataset}_tuning"
+    if args.output_config is None:
+        args.output_config = f"configs/{dataset}_tuned.yaml"
+
+    # Dataset-scoped Optuna artifacts: outputs/{dataset}/optuna/
+    optuna_dir = os.path.join(project_root, "outputs", dataset, "optuna")
     os.makedirs(optuna_dir, exist_ok=True)
 
     # Default SQLite storage for resumeability
@@ -486,9 +493,15 @@ def main():
         best_lr = 1e-4
         best_wd = 1e-4
 
+    # Pull both dataset path blocks from full.yaml so the exported config is
+    # valid for either dataset (previously only `uwiqa` was written, even for saud).
+    base_cfg_path = os.path.join(project_root, "configs", "full.yaml")
+    with open(base_cfg_path, "r") as f:
+        base_cfg = yaml.safe_load(f)
+
     tuned_config = {
-        "mode": "full",
-        "dataset": args.dataset,
+        "mode": "tuned",
+        "dataset": dataset,
         "seed": args.seed,
         "image_size": 224,
         "patch_sizes": [32, 64, 128],
@@ -525,11 +538,15 @@ def main():
                 "rotation": int(p["rotation_deg"]),
             }
         },
-        "uwiqa": {
+        "uwiqa": base_cfg.get("uwiqa", {
             "image_dir": "../UWIQA dataset/UWIQA",
             "score_file": "../UWIQA dataset/IQA Value.xlsx",
-        },
-        "checkpoint_dir": "checkpoints/full_tuned",
+        }),
+        "saud": base_cfg.get("saud", {
+            "benchmark_dir": "../SAUD/Benchmark",
+            "bt_scores_mat": "../SAUD/sub_bt_scores.mat",
+        }),
+        "checkpoint_dir": f"checkpoints/{dataset}/{args.study_name}",
         "checkpoint": {
             "save_best_on": "srocc",
             "mode": "max",
@@ -551,6 +568,7 @@ def main():
     with open(summary_path, "w") as f:
         json.dump(
             {
+                "dataset": dataset,
                 "best_trial_number": best_trial.number,
                 "best_val_srocc": best_trial.value,
                 "best_params": best_trial.params,

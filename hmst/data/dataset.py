@@ -1,7 +1,7 @@
 """
-data/dataset.py
+dataset.py
 ---------------
-Dataset loaders for UWIQA and SAUD datasets.
+Dataset loaders for UWIQA, SAUD and UIED datasets.
 
 UWIQA
   890 images (0001.png – 0890.png)
@@ -13,6 +13,9 @@ SAUD
   BT scores in sub_bt_scores.mat (Bradley-Terry, unbounded)
   Split: 800 train / 200 test
   For ranking loss: pairs of enhanced images from the same raw
+
+UIED
+
 
 Both datasets use the same Dataset class interface.
 """

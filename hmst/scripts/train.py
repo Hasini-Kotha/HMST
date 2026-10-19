@@ -17,6 +17,8 @@ import os
 import argparse
 import random
 import time
+import json
+import csv
 
 # Make the project root importable from scripts/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -36,6 +38,11 @@ from data import (
 )
 from models import HMST, HMSTLoss, build_correspondence_matrix
 from training import HMSTTrainer, build_optimizer
+from training.plots import (
+    save_error_analysis_plots,
+    save_quality_plots,
+    save_training_dynamics_plots,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -108,6 +115,38 @@ def make_absolute(path: str, base: str) -> str:
             return alt_resolved
 
     return resolved
+
+
+def dataset_output_dir(dataset: str, mode: str, project_root: str, iter_suffix: str = "") -> str:
+    """Dataset-scoped output directory: outputs/{dataset}/{mode}{iter_suffix}."""
+    return make_absolute(f"outputs/{dataset}/{mode}{iter_suffix}", project_root)
+
+
+def dataset_checkpoint_dir(dataset: str, mode: str, project_root: str, iter_suffix: str = "") -> str:
+    """Dataset-scoped checkpoint directory: checkpoints/{dataset}/{mode}{iter_suffix}."""
+    return make_absolute(f"checkpoints/{dataset}/{mode}{iter_suffix}", project_root)
+
+
+def write_run_marker(directory: str, dataset: str, mode: str) -> None:
+    """Write run.json identifying the dataset/mode that owns this directory."""
+    os.makedirs(directory, exist_ok=True)
+    with open(os.path.join(directory, "run.json"), "w") as f:
+        json.dump({"dataset": dataset, "mode": mode}, f, indent=2)
+
+
+def assert_dataset_matches(directory: str, dataset: str) -> None:
+    """Hard-fail if an existing run.json in `directory` belongs to a different dataset."""
+    marker = os.path.join(directory, "run.json")
+    if not os.path.exists(marker):
+        return
+    with open(marker, "r") as f:
+        recorded = json.load(f)
+    if recorded.get("dataset") != dataset:
+        raise RuntimeError(
+            f"Dataset mismatch in '{directory}': run.json records dataset "
+            f"'{recorded.get('dataset')}' but current dataset is '{dataset}'. "
+            f"Refusing to mix artifacts from different datasets."
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -188,6 +227,26 @@ def build_datasets(config: dict, project_root: str):
     return train_ds, val_ds, test_ds
 
 
+def build_full_evaluation_dataset(config: dict, project_root: str):
+    """Build the complete, non-augmented UWIQA dataset for per-image plots."""
+    if config.get("dataset", "uwiqa") != "uwiqa":
+        return None
+
+    dataset_config = config["uwiqa"]
+    image_dir = make_absolute(dataset_config["image_dir"], project_root)
+    score_file = make_absolute(dataset_config["score_file"], project_root)
+    train_indices, test_indices = make_uwiqa_splits(
+        image_dir, score_file, seed=config.get("seed", 42)
+    )
+    all_indices = sorted(train_indices + test_indices)
+    return UWIQADataset(
+        image_dir,
+        score_file,
+        all_indices,
+        get_val_transforms(config.get("image_size", 224)),
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,13 +303,14 @@ def main():
         config["dataset"] = args.dataset
 
     mode = config.get("mode", args.mode or "full")
+    dataset = config.get("dataset", "uwiqa")
 
     # Override resume from CLI
     resume_path = args.resume
     if resume_path is None and config.get("resume", False):
-        default_resume = os.path.join(
-            project_root, config["checkpoint_dir"], "latest.pt"
-        )
+        default_resume_dir = dataset_checkpoint_dir(dataset, mode, project_root)
+        assert_dataset_matches(default_resume_dir, dataset)
+        default_resume = os.path.join(default_resume_dir, "latest.pt")
         if os.path.exists(default_resume):
             resume_path = default_resume
 
@@ -281,20 +341,77 @@ def main():
 
     for it in range(num_iterations):
         iter_suffix = f"_iter{it+1}" if num_iterations > 1 else ""
-        checkpoint_dir = make_absolute(config["checkpoint_dir"] + iter_suffix, project_root)
-        output_dir = make_absolute(f"outputs/{mode}{iter_suffix}", project_root)
+        checkpoint_dir = dataset_checkpoint_dir(dataset, mode, project_root, iter_suffix)
+        output_dir = dataset_output_dir(dataset, mode, project_root, iter_suffix)
+        # Hard-fail if either dir was previously owned by a different dataset.
+        assert_dataset_matches(checkpoint_dir, dataset)
+        assert_dataset_matches(output_dir, dataset)
+        write_run_marker(checkpoint_dir, dataset, mode)
+        write_run_marker(output_dir, dataset, mode)
         final_path = os.path.join(output_dir, "test_metrics.json")
         std_path = os.path.join(output_dir, "test_metrics_no_tta.json")
 
-        if num_iterations > 1 and os.path.exists(final_path):
+        required_plot_names = (
+            "A1_test_predicted_vs_actual_tta.png",
+            "A2_test_raw_vs_fitted.png",
+            "A3_validation_vs_test_tta.png",
+            "A4_test_error_magnitude.png",
+            "B5_residual_vs_actual_mos.png",
+            "B6_error_histogram_kde_tta_comparison.png",
+            "B7_absolute_error_violin_box.png",
+            "B8_best_worst_prediction_images.png",
+            "B9_per_image_error_pareto.png",
+            "C10_loss_curves.png",
+            "C11_metric_curves.png",
+            "C12_learning_rate_schedule.png",
+            "C13_early_stopping_convergence.png",
+        )
+        history_path = os.path.join(output_dir, "history.csv")
+        training_plot_paths = [
+            os.path.join(output_dir, "plots", name)
+            for name in required_plot_names
+            if name.startswith("C")
+        ]
+        if os.path.isfile(history_path) and not all(
+            os.path.isfile(path) for path in training_plot_paths
+        ):
+            with open(history_path, "r", newline="", encoding="utf-8") as history_file:
+                history = [
+                    {key: float(value) for key, value in row.items() if value not in (None, "")}
+                    for row in csv.DictReader(history_file)
+                ]
+            save_training_dynamics_plots(
+                history,
+                output_dir=os.path.join(output_dir, "plots"),
+                monitor=config.get("early_stopping", {}).get("monitor", "srocc"),
+                mode=config.get("early_stopping", {}).get("mode", "max"),
+            )
+        plots_complete = all(
+            os.path.isfile(os.path.join(output_dir, "plots", name))
+            for name in required_plot_names
+        )
+        if num_iterations > 1 and os.path.exists(final_path) and plots_complete:
             print(f"\n[Trainer] Iteration {it+1} already completed. Loading metrics and skipping...")
             import json
             with open(final_path, "r") as f:
-                all_metrics.append(json.load(f))
+                loaded_tta = json.load(f)
+            loaded_tta.setdefault("iteration", it + 1)
+            if base_seed is not None:
+                loaded_tta.setdefault("seed", base_seed + it)
+            all_metrics.append(loaded_tta)
             if os.path.exists(std_path):
                 with open(std_path, "r") as f:
-                    all_metrics_no_tta.append(json.load(f))
+                    loaded_no_tta = json.load(f)
+                loaded_no_tta.setdefault("iteration", it + 1)
+                if base_seed is not None:
+                    loaded_no_tta.setdefault("seed", base_seed + it)
+                all_metrics_no_tta.append(loaded_no_tta)
             continue
+        if num_iterations > 1 and os.path.exists(final_path) and not plots_complete:
+            print(
+                f"\n[Trainer] Iteration {it+1} has metrics but is missing correlation plots; "
+                "running its evaluation path to create them."
+            )
 
         if num_iterations > 1:
             print(f"\n{'#'*60}")
@@ -459,9 +576,66 @@ def main():
         result_tta = collect_predictions_tta(model, test_loader, device)
         final_metrics_tta = compute_metrics(result_tta["predictions"], result_tta["targets"])
 
+        if dataset in {"uwiqa", "saud"}:
+            validation_result_tta = collect_predictions_tta(model, val_loader, device)
+            validation_metrics_tta = compute_metrics(
+                validation_result_tta["predictions"],
+                validation_result_tta["targets"],
+            )
+            plot_paths = save_quality_plots(
+                actual_test=result_tta["targets"],
+                predicted_test_tta=result_tta["predictions"],
+                test_metrics=final_metrics_tta,
+                actual_validation=validation_result_tta["targets"],
+                predicted_validation_tta=validation_result_tta["predictions"],
+                validation_metrics=validation_metrics_tta,
+                output_dir=os.path.join(output_dir, "plots"),
+            )
+            pareto_dataset = build_full_evaluation_dataset(config, project_root)
+            pareto_result = result_tta
+            if pareto_dataset is not None:
+                pareto_loader = DataLoader(
+                    pareto_dataset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=num_workers,
+                    pin_memory=(device.type == "cuda"),
+                )
+                pareto_result = collect_predictions_tta(model, pareto_loader, device)
+            error_plot_paths = save_error_analysis_plots(
+                actual=result_tta["targets"],
+                predicted_tta=result_tta["predictions"],
+                predicted_no_tta=result["predictions"],
+                image_paths=result_tta.get("paths", []),
+                output_dir=os.path.join(output_dir, "plots"),
+                pareto_actual=pareto_result["targets"],
+                pareto_predicted=pareto_result["predictions"],
+            )
+            print("Correlation plots saved:")
+            for plot_path in (*plot_paths, *error_plot_paths):
+                print(f"  {plot_path}")
+
+        # Tag metrics with iteration index / seed (used for best-iteration tracking)
+        final_metrics_tta["iteration"] = it + 1
+        final_metrics_tta["seed"] = iter_seed
+        final_metrics["iteration"] = it + 1
+        final_metrics["seed"] = iter_seed
+
         # Use TTA metrics as the reported result (better stability)
         all_metrics.append(final_metrics_tta)
         all_metrics_no_tta.append(final_metrics)
+
+        # Persist MAE / MedAE into the metric dicts (previously console-only)
+        abs_err_tta = np.abs(result_tta["predictions"] - result_tta["targets"])
+        abs_err_no_tta = np.abs(result["predictions"] - result["targets"])
+        final_metrics_tta.update({
+            "mae": float(np.mean(abs_err_tta)),
+            "medae": float(np.median(abs_err_tta)),
+        })
+        final_metrics.update({
+            "mae": float(np.mean(abs_err_no_tta)),
+            "medae": float(np.median(abs_err_no_tta)),
+        })
 
         import json
         final_path = os.path.join(output_dir, "test_metrics.json")
@@ -543,7 +717,10 @@ def main():
             print(f"      • {w['image']:<12}: Actual={w['actual_mos']:.4f}, Pred={w['pred_mos_tta']:.4f} (Diff: {w['abs_error_tta']:.4f})")
         print(f"{'='*60}\n")
 
-    if num_iterations > 1 and len(all_metrics) > 0:
+    if len(all_metrics) > 0:
+        summary_dir = dataset_output_dir(dataset, mode, project_root)
+        os.makedirs(summary_dir, exist_ok=True)
+
         print(f"\n{'='*65}")
         print(f"BENCHMARK SUMMARY ACROSS {len(all_metrics)} ITERATIONS (Single View vs TTA)")
         print(f"{'='*65}")
@@ -602,6 +779,39 @@ def main():
                 "std":    {"srocc": std_srocc_raw, "plcc": std_plcc_raw, "krcc": std_krcc_raw, "rmse": std_rmse_raw},
                 "all_iterations": all_metrics_no_tta,
             }
+
+        # ── Best iteration (selected by TTA SROCC) ────────────────────────────
+        best_idx = int(np.argmax([m["srocc"] for m in all_metrics]))
+        best_metric = all_metrics[best_idx]
+        best_iter = int(best_metric.get("iteration", best_idx + 1))
+        summary_data["best_iteration"] = {
+            "criterion": "srocc (TTA 4-view)",
+            "iteration": best_iter,
+            "seed": best_metric.get("seed"),
+            "metrics": best_metric,
+        }
+        print(f"{'='*65}")
+        print(f"BEST ITERATION (by TTA SROCC): Iteration {best_iter}  (seed={best_metric.get('seed')})")
+        print(f"{'='*65}")
+        print(f"  SROCC: {best_metric['srocc']:.4f}  PLCC: {best_metric['plcc']:.4f}  "
+              f"KRCC: {best_metric['krcc']:.4f}  RMSE: {best_metric['rmse']:.4f}")
+        if "mae" in best_metric:
+            print(f"  MAE:   {best_metric['mae']:.4f}  MedAE: {best_metric.get('medae', float('nan')):.4f}")
+
+        # Persist consolidated copies of the best iteration's artifacts
+        best_iter_suffix = f"_iter{best_iter}" if num_iterations > 1 else ""
+        best_src_dir = dataset_output_dir(dataset, mode, project_root, best_iter_suffix)
+        import shutil
+        best_pred_src = os.path.join(best_src_dir, "test_predictions.csv")
+        best_pred_dst = os.path.join(summary_dir, "best_iteration_predictions.csv")
+        if os.path.exists(best_pred_src) and os.path.abspath(best_pred_src) != os.path.abspath(best_pred_dst):
+            shutil.copyfile(best_pred_src, best_pred_dst)
+            print(f"  Best per-image predictions -> {best_pred_dst}")
+        best_metric_dst = os.path.join(summary_dir, "best_iteration_metrics.json")
+        with open(best_metric_dst, "w") as f:
+            json.dump(best_metric, f, indent=2)
+        print(f"  Best metrics JSON -> {best_metric_dst}")
+        print(f"{'='*65}\n")
 
         # ── Top-10 Summary (when running > 10 iterations, e.g. 15) ──────────
         if len(all_metrics) > 10:
@@ -674,8 +884,6 @@ def main():
                 print(f"  RMSE:        {t_med_rmse:.4f}       {t_mean_rmse:.4f}      (±{t_std_rmse:.4f})  [4-param logistic]")
                 print(f"{'='*60}\n")
 
-        summary_dir = make_absolute(f"outputs/{mode}", project_root)
-        os.makedirs(summary_dir, exist_ok=True)
         summary_file = os.path.join(summary_dir, f"{num_iterations}_iterations_summary.json")
         with open(summary_file, "w") as f:
             json.dump(summary_data, f, indent=2)

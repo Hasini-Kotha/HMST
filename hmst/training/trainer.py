@@ -39,6 +39,7 @@ from torch.amp import GradScaler, autocast
 
 from training.metrics import compute_metrics, collect_predictions
 from training.checkpoint import save_checkpoint, load_checkpoint
+from training.plots import save_training_dynamics_plots
 
 
 class HMSTTrainer:
@@ -104,6 +105,8 @@ class HMSTTrainer:
         """Run one training epoch."""
         self.model.train()
         running = {"loss": 0.0, "loss_mos": 0.0, "loss_rank": 0.0, "loss_cons": 0.0}
+        predictions = []
+        targets = []
         n_batches = 0
 
         for batch_idx, batch in enumerate(dataloader):
@@ -127,16 +130,21 @@ class HMSTTrainer:
 
             for k in running:
                 running[k] += loss_dict[k].item()
+            predictions.append(output["Q_hat"].detach().cpu().numpy())
+            targets.append(scores.detach().cpu().numpy())
             n_batches += 1
 
-        return {k: v / max(n_batches, 1) for k, v in running.items()}
+        epoch_metrics = {k: v / max(n_batches, 1) for k, v in running.items()}
+        if predictions:
+            epoch_metrics.update(compute_metrics(np.concatenate(predictions), np.concatenate(targets)))
+        return epoch_metrics
 
     def _val_epoch(self, dataloader: DataLoader) -> Dict[str, float]:
         """Run validation and compute all metrics."""
         self.model.eval()
         preds_list = []
         tgts_list = []
-        val_loss = 0.0
+        running = {"loss": 0.0, "loss_mos": 0.0, "loss_rank": 0.0, "loss_cons": 0.0}
         n_batches = 0
 
         with torch.no_grad():
@@ -147,7 +155,8 @@ class HMSTTrainer:
                 output = self.model(images)
                 loss_dict = self.criterion(output, scores)
 
-                val_loss += loss_dict["loss"].item()
+                for key in running:
+                    running[key] += loss_dict[key].item()
                 preds_list.append(output["Q_hat"].cpu().numpy())
                 tgts_list.append(scores.cpu().numpy())
                 n_batches += 1
@@ -155,7 +164,8 @@ class HMSTTrainer:
         predictions = np.concatenate(preds_list)
         targets     = np.concatenate(tgts_list)
         metrics = compute_metrics(predictions, targets)
-        metrics["loss"] = val_loss / max(n_batches, 1)
+        for key, value in running.items():
+            metrics[key] = value / max(n_batches, 1)
         return metrics
 
     def fit(
@@ -190,6 +200,7 @@ class HMSTTrainer:
 
         for epoch in range(self.start_epoch, self.epochs):
             epoch_start = time.time()
+            learning_rate = self.optimizer.param_groups[0]["lr"]
 
             # Training
             train_metrics = self._train_epoch(train_loader)
@@ -213,11 +224,19 @@ class HMSTTrainer:
                 "train_loss_mos": train_metrics["loss_mos"],
                 "train_loss_rank":train_metrics["loss_rank"],
                 "train_loss_cons":train_metrics["loss_cons"],
+                "train_plcc":      train_metrics.get("plcc", float("nan")),
+                "train_srocc":     train_metrics.get("srocc", float("nan")),
+                "train_krcc":      train_metrics.get("krcc", float("nan")),
+                "train_rmse":      train_metrics.get("rmse", float("nan")),
                 "val_loss":       val_metrics["loss"],
+                "val_loss_mos":   val_metrics["loss_mos"],
+                "val_loss_rank":  val_metrics["loss_rank"],
+                "val_loss_cons":  val_metrics["loss_cons"],
                 "val_plcc":       val_metrics["plcc"],
                 "val_srocc":      val_metrics["srocc"],
                 "val_krcc":       val_metrics["krcc"],
                 "val_rmse":       val_metrics["rmse"],
+                "learning_rate":  learning_rate,
                 "time_s":         epoch_time,
             }
             self.training_history.append(epoch_record)
@@ -281,6 +300,14 @@ class HMSTTrainer:
                 break
 
         print("\n[Trainer] Training complete.")
+        dynamics_paths = save_training_dynamics_plots(
+            self.training_history,
+            output_dir=str(self.output_dir / "plots"),
+            monitor=self.es_monitor,
+            mode=self.es_mode,
+        )
+        for plot_path in dynamics_paths:
+            print(f"[Trainer] Training dynamics plot saved to {plot_path}")
         self._save_final_metrics(val_loader)
 
     def _save_ckpt(self, filename: str, epoch: int) -> None:
@@ -300,7 +327,9 @@ class HMSTTrainer:
         if not self.training_history:
             return
         csv_path = self.output_dir / "history.csv"
-        keys = list(self.training_history[0].keys())
+        keys = list(dict.fromkeys(
+            key for record in self.training_history for key in record
+        ))
         with open(csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=keys)
             writer.writeheader()
