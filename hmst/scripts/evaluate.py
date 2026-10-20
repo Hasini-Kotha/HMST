@@ -34,8 +34,18 @@ from scripts.train import (
 from models import HMST, build_correspondence_matrix
 from models.losses import HMSTLoss
 from training.checkpoint import load_checkpoint
-from training.metrics import compute_metrics, collect_predictions, collect_predictions_tta
-from training.plots import save_error_analysis_plots, save_quality_plots
+from training.metrics import (
+    collect_interpretability_data,
+    collect_predictions,
+    collect_predictions_tta,
+    compute_metrics,
+)
+from training.plots import (
+    save_error_analysis_plots,
+    save_model_interpretability_plots,
+    save_quality_plots,
+    save_split_distribution_plots,
+)
 
 
 def main():
@@ -68,7 +78,17 @@ def main():
     print(f"Output dir: {out_dir}")
 
     # Dataset
-    _, val_ds, test_ds = build_datasets(config, project_root)
+    train_ds, val_ds, test_ds = build_datasets(config, project_root)
+    split_plot_paths = save_split_distribution_plots(
+        train_ds,
+        val_ds,
+        test_ds,
+        output_dir=os.path.join(out_dir, "plots"),
+        mos_range=(0.2, 1.0) if dataset == "uwiqa" else (0.0, 1.0),
+    )
+    print("Split distribution plots saved:")
+    for plot_path in split_plot_paths:
+        print(f"  {plot_path}")
     batch_size = config.get("batch_size", 4)
     num_workers = config.get("num_workers", 0)
 
@@ -220,8 +240,21 @@ def main():
             pareto_actual=pareto_result["targets"],
             pareto_predicted=pareto_result["predictions"],
         )
+        interpretability_data = collect_interpretability_data(model, test_loader, device)
+        correspondence_matrix = build_correspondence_matrix(
+            num_patches_fine=model.num_patches[0],
+            num_patches_coarse=model.num_patches[2],
+            grid_fine=model.grid_sizes[0],
+            grid_coarse=model.grid_sizes[2],
+        )
+        interpretability_plot_paths = save_model_interpretability_plots(
+            interpretability_data,
+            model,
+            correspondence_matrix,
+            output_dir=os.path.join(out_dir, "plots"),
+        )
         print("Correlation plots saved:")
-        for plot_path in (*plot_paths, *error_plot_paths):
+        for plot_path in (*plot_paths, *error_plot_paths, *interpretability_plot_paths):
             print(f"  {plot_path}")
 
 

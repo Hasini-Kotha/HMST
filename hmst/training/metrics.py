@@ -13,7 +13,7 @@ From §9.1–§9.3 of Underwater_ideas.pdf.
 import numpy as np
 from scipy import stats
 from scipy.optimize import curve_fit
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 import torch
 
 
@@ -239,3 +239,49 @@ def collect_predictions_tta(
     if paths_list:
         res["paths"] = paths_list
     return res
+
+
+def collect_interpretability_data(
+    model: torch.nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    device: torch.device,
+) -> Dict[str, Any]:
+    """Collect HMST scale weights, per-scale qualities, and one image's maps."""
+    model.eval()
+    lambda_batches = []
+    scale_quality_batches = None
+    reference = None
+
+    with torch.no_grad():
+        for batch in dataloader:
+            images = batch["image"].to(device)
+            output = model(images)
+            if scale_quality_batches is None:
+                scale_quality_batches = [[] for _ in output["qualities"]]
+
+            lambda_batches.append(output["lambda_s"].cpu().numpy())
+            for scale_index, (alphas, qualities) in enumerate(
+                zip(output["alphas"], output["qualities"])
+            ):
+                scale_quality = (alphas * qualities).sum(dim=1).squeeze(-1)
+                scale_quality_batches[scale_index].append(scale_quality.cpu().numpy())
+
+            if reference is None:
+                reference = {
+                    "image": images[0].detach().cpu().numpy(),
+                    "alphas": [alpha[0].detach().cpu().numpy().reshape(-1)
+                               for alpha in output["alphas"]],
+                    "regions": [region[0].detach().cpu().numpy().reshape(-1)
+                                for region in output["Q_regions"]],
+                }
+
+    if not lambda_batches or reference is None or scale_quality_batches is None:
+        raise ValueError("Cannot collect interpretability data from an empty dataloader.")
+
+    return {
+        "lambda_weights": np.concatenate(lambda_batches, axis=0),
+        "scale_qualities": [np.concatenate(values, axis=0) for values in scale_quality_batches],
+        "reference_image": reference["image"],
+        "reference_alphas": reference["alphas"],
+        "reference_regions": reference["regions"],
+    }

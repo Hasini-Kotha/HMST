@@ -40,7 +40,9 @@ from models import HMST, HMSTLoss, build_correspondence_matrix
 from training import HMSTTrainer, build_optimizer
 from training.plots import (
     save_error_analysis_plots,
+    save_model_interpretability_plots,
     save_quality_plots,
+    save_split_distribution_plots,
     save_training_dynamics_plots,
 )
 
@@ -365,6 +367,9 @@ def main():
             "C11_metric_curves.png",
             "C12_learning_rate_schedule.png",
             "C13_early_stopping_convergence.png",
+            "F22_mos_distribution.png",
+            "F23_split_sample_counts.png",
+            "F24_split_distribution_ks.png",
         )
         history_path = os.path.join(output_dir, "history.csv")
         training_plot_paths = [
@@ -385,6 +390,26 @@ def main():
                 output_dir=os.path.join(output_dir, "plots"),
                 monitor=config.get("early_stopping", {}).get("monitor", "srocc"),
                 mode=config.get("early_stopping", {}).get("mode", "max"),
+            )
+        split_plot_paths = [
+            os.path.join(output_dir, "plots", name)
+            for name in required_plot_names
+            if name.startswith("F")
+        ]
+        if os.path.exists(final_path) and not all(
+            os.path.isfile(path) for path in split_plot_paths
+        ):
+            split_config = dict(config)
+            split_config["seed"] = base_seed + it if base_seed is not None else 42000 + it
+            split_train_ds, split_val_ds, split_test_ds = build_datasets(
+                split_config, project_root
+            )
+            save_split_distribution_plots(
+                split_train_ds,
+                split_val_ds,
+                split_test_ds,
+                output_dir=os.path.join(output_dir, "plots"),
+                mos_range=(0.2, 1.0) if dataset == "uwiqa" else (0.0, 1.0),
             )
         plots_complete = all(
             os.path.isfile(os.path.join(output_dir, "plots", name))
@@ -426,6 +451,13 @@ def main():
         # ── Datasets ──────────────────────────────────────────────────────────
         print(f"\nBuilding datasets...")
         train_ds, val_ds, test_ds = build_datasets(config, project_root)
+        save_split_distribution_plots(
+            train_ds,
+            val_ds,
+            test_ds,
+            output_dir=os.path.join(output_dir, "plots"),
+            mos_range=(0.2, 1.0) if dataset == "uwiqa" else (0.0, 1.0),
+        )
 
         print(f"  Train:  {len(train_ds)} samples")
         print(f"  Val:    {len(val_ds)} samples")
@@ -559,7 +591,12 @@ def main():
         # ── Final test evaluation ─────────────────────────────────────────────
         print(f"\n{'='*60}")
         print(f"Final evaluation on test set for iteration {it+1}...")
-        from training.metrics import compute_metrics, collect_predictions, collect_predictions_tta
+        from training.metrics import (
+            compute_metrics,
+            collect_interpretability_data,
+            collect_predictions,
+            collect_predictions_tta,
+        )
 
         best_ckpt_path = os.path.join(checkpoint_dir, "best.pt")
         if os.path.exists(best_ckpt_path):
@@ -611,8 +648,15 @@ def main():
                 pareto_actual=pareto_result["targets"],
                 pareto_predicted=pareto_result["predictions"],
             )
+            interpretability_data = collect_interpretability_data(model, test_loader, device)
+            interpretability_plot_paths = save_model_interpretability_plots(
+                interpretability_data,
+                model,
+                M,
+                output_dir=os.path.join(output_dir, "plots"),
+            )
             print("Correlation plots saved:")
-            for plot_path in (*plot_paths, *error_plot_paths):
+            for plot_path in (*plot_paths, *error_plot_paths, *interpretability_plot_paths):
                 print(f"  {plot_path}")
 
         # Tag metrics with iteration index / seed (used for best-iteration tracking)
