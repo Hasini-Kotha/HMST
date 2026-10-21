@@ -31,6 +31,9 @@ def save_checkpoint(
     best_metric: float,
     training_history: list,
     config: dict,
+    scheduler: Optional[Any] = None,
+    scaler: Optional[Any] = None,
+    trainer_state: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Save a training checkpoint.
@@ -62,6 +65,12 @@ def save_checkpoint(
         "config":               config,
         "random_state":         random_state,
     }
+    if scheduler is not None:
+        checkpoint["scheduler_state_dict"] = scheduler.state_dict()
+    if scaler is not None:
+        checkpoint["scaler_state_dict"] = scaler.state_dict()
+    if trainer_state is not None:
+        checkpoint["trainer_state"] = trainer_state
 
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, path)
@@ -72,6 +81,8 @@ def load_checkpoint(
     model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
     device: Optional[torch.device] = None,
+    scheduler: Optional[Any] = None,
+    scaler: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Load a checkpoint and restore model/optimizer state.
@@ -94,6 +105,25 @@ def load_checkpoint(
 
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    if scheduler is not None and "scheduler_state_dict" in checkpoint:
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    elif scheduler is not None and isinstance(
+        scheduler,
+        (torch.optim.lr_scheduler.CosineAnnealingLR, torch.optim.lr_scheduler.StepLR),
+    ):
+        completed_steps = int(checkpoint.get("epoch", -1)) + 1
+        if completed_steps > 0:
+            scheduler_state = scheduler.state_dict()
+            scheduler_state["last_epoch"] = completed_steps
+            if "_step_count" in scheduler_state:
+                scheduler_state["_step_count"] = completed_steps + 1
+            if "_last_lr" in scheduler_state and optimizer is not None:
+                scheduler_state["_last_lr"] = [
+                    group["lr"] for group in optimizer.param_groups
+                ]
+            scheduler.load_state_dict(scheduler_state)
+    if scaler is not None and "scaler_state_dict" in checkpoint:
+        scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
     # Restore random states for reproducibility.
     # Skip when loading for inference (optimizer=None) — only model weights matter.

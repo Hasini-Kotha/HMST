@@ -185,12 +185,24 @@ class HMSTTrainer:
         # ── Resume from checkpoint ─────────────────────────────────────────
         if resume_path and Path(resume_path).exists():
             print(f"\n[Trainer] Resuming from: {resume_path}")
-            ckpt = load_checkpoint(resume_path, self.model, self.optimizer, self.device)
+            ckpt = load_checkpoint(
+                resume_path,
+                self.model,
+                self.optimizer,
+                self.device,
+                scheduler=self.scheduler,
+                scaler=self.scaler,
+            )
             self.start_epoch = ckpt["epoch"] + 1
             default_best = -float("inf") if self.save_mode == "max" else float("inf")
             self.best_metric = ckpt.get("best_metric", default_best)
-            self.best_es_metric = self.best_metric  # Approximate sync on resume
+            trainer_state = ckpt.get("trainer_state", {})
             self.training_history = ckpt.get("training_history", [])
+            if "best_es_metric" in trainer_state and "es_counter" in trainer_state:
+                self.best_es_metric = trainer_state["best_es_metric"]
+                self.es_counter = trainer_state["es_counter"]
+            else:
+                self._restore_monitor_state()
             print(f"[Trainer] Continuing from epoch {self.start_epoch}")
         else:
             print(f"\n[Trainer] Starting training from epoch 0")
@@ -257,13 +269,6 @@ class HMSTTrainer:
                 f"Time: {epoch_time:.1f}s"
             )
 
-            # ── Save latest checkpoint ─────────────────────────────────────
-            self._save_ckpt("latest.pt", epoch)
-
-            # ── Save epoch checkpoint (test mode) ─────────────────────────
-            if save_every:
-                self._save_ckpt(f"epoch_{epoch+1:03d}.pt", epoch)
-
             # ── Save best checkpoint ───────────────────────────────────────
             is_best = False
             if self.save_mode == "max":
@@ -275,7 +280,6 @@ class HMSTTrainer:
                     
             if is_best:
                 self.best_metric = ckpt_val
-                self._save_ckpt("best.pt", epoch)
                 print(f"  → New best {self.save_monitor.upper()}: {self.best_metric:.4f} — saved best.pt")
 
             # ── Early Stopping ─────────────────────────────────────────────
@@ -294,6 +298,14 @@ class HMSTTrainer:
             else:
                 self.es_counter += 1
                 print(f"  → {self.es_monitor.upper()} did not improve. Patience: {self.es_counter}/{self.es_patience}")
+
+            # Save after the epoch state is finalized so a resume starts at the
+            # exact next epoch with scheduler and early-stopping state aligned.
+            self._save_ckpt("latest.pt", epoch)
+            if save_every:
+                self._save_ckpt(f"epoch_{epoch+1:03d}.pt", epoch)
+            if is_best:
+                self._save_ckpt("best.pt", epoch)
                 
             if self.es_counter >= self.es_patience and (epoch + 1) >= self.min_epochs:
                 print(f"\n[Trainer] Early stopping triggered after {epoch + 1} epochs!")
@@ -320,7 +332,53 @@ class HMSTTrainer:
             best_metric=self.best_metric,
             training_history=self.training_history,
             config=self.config,
+            scheduler=self.scheduler,
+            scaler=self.scaler,
+            trainer_state={
+                "best_es_metric": self.best_es_metric,
+                "es_counter": self.es_counter,
+            },
         )
+
+    def _restore_monitor_state(self) -> None:
+        """Recover best and patience state from histories in legacy checkpoints."""
+        es_best = -float("inf") if self.es_mode == "max" else float("inf")
+        save_best = -float("inf") if self.save_mode == "max" else float("inf")
+        self.es_counter = 0
+        es_key = "val_loss" if self.es_monitor == "loss" else f"val_{self.es_monitor}"
+        save_key = "val_loss" if self.save_monitor == "loss" else f"val_{self.save_monitor}"
+        has_es_value = False
+        has_save_value = False
+
+        for record in self.training_history:
+            es_value = record.get(es_key)
+            if es_value is not None and np.isfinite(es_value):
+                improved = (
+                    es_value > es_best + self.es_min_delta
+                    if self.es_mode == "max"
+                    else es_value < es_best - self.es_min_delta
+                )
+                if improved:
+                    es_best = es_value
+                    self.es_counter = 0
+                else:
+                    self.es_counter += 1
+                has_es_value = True
+
+            save_value = record.get(save_key)
+            if save_value is not None and np.isfinite(save_value):
+                improved = save_value > save_best if self.save_mode == "max" else save_value < save_best
+                if improved:
+                    save_best = save_value
+                has_save_value = True
+
+        if has_es_value:
+            self.best_es_metric = es_best
+        else:
+            self.best_es_metric = self.best_metric
+            self.es_counter = 0
+        if has_save_value:
+            self.best_metric = save_best
 
     def _write_history(self) -> None:
         """Write training history to CSV."""
