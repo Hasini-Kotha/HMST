@@ -30,6 +30,8 @@ from scripts.train import (
     set_seed,
     dataset_output_dir,
     build_full_evaluation_dataset,
+    resolve_config_path,
+    validate_training_config,
 )
 from models import HMST, build_correspondence_matrix
 from models.losses import HMSTLoss
@@ -42,34 +44,97 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate HMST Architecture 1")
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to checkpoint .pt file")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to configuration YAML file (e.g. configs/uwiqa_tuned.yaml)")
     parser.add_argument("--mode", type=str, choices=["test", "full"], default="full",
-                        help="Config mode to use for dataset settings")
+                        help="Config mode fallback if --config is not specified")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Override evaluation batch size (defaults to batch_size in config)")
     parser.add_argument("--dataset", type=str, default=None,
                         choices=["uwiqa", "saud"])
+    parser.add_argument("--backbone", type=str, default=None,
+                        choices=["resnet50", "convnext", "convnext_tiny"],
+                        help="Override backbone architecture: 'resnet50' (default) or 'convnext'")
     args = parser.parse_args()
 
     project_root = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
-    config = load_config(args.mode)
+
+    # Load configuration: --config has priority over --mode
+    if args.config:
+        cfg_path = resolve_config_path(args.config, project_root)
+        with open(cfg_path, "r") as f:
+            config = yaml.safe_load(f)
+        validate_training_config(config, cfg_path)
+        print(f"[Config] Successfully loaded and validated custom config: {cfg_path}")
+    else:
+        config = load_config(args.mode)
+        cfg_path = os.path.normpath(os.path.join(project_root, "configs", f"{args.mode}.yaml"))
+        validate_training_config(config, cfg_path)
+
     if args.dataset:
         config["dataset"] = args.dataset
 
     mode    = config.get("mode", args.mode or "full")
     dataset = config.get("dataset", "uwiqa")
-    out_dir = dataset_output_dir(dataset, mode, project_root)
+
+    # Read the checkpoint's stored config early to determine dataset and backbone
+    ckpt_meta = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    ckpt_cfg  = ckpt_meta.get("config", {})
+    ckpt_ds   = ckpt_cfg.get("dataset")
+    if ckpt_ds is not None and ckpt_ds != dataset:
+        raise RuntimeError(
+            f"Checkpoint '{args.checkpoint}' records dataset '{ckpt_ds}' "
+            f"but evaluation is configured for dataset '{dataset}'."
+        )
+
+    # Determine backbone: CLI flag > checkpoint config > YAML config > 'resnet50'
+    if args.backbone is not None:
+        selected_backbone = args.backbone.lower().strip().replace("-", "_")
+        if selected_backbone == "convnext_tiny":
+            selected_backbone = "convnext"
+    else:
+        cfg_bb = ckpt_cfg.get("backbone", config.get("backbone", "resnet50"))
+        selected_backbone = str(cfg_bb).lower().strip().replace("-", "_")
+        if selected_backbone == "convnext_tiny":
+            selected_backbone = "convnext"
+
+    if selected_backbone not in ("resnet50", "convnext"):
+        raise ValueError(
+            f"Unsupported backbone '{args.backbone or ckpt_cfg.get('backbone')}'. "
+            f"Supported values: ['resnet50', 'convnext']"
+        )
+    backbone = selected_backbone
+    out_dir = dataset_output_dir(dataset, mode, project_root, backbone=backbone)
 
     seed = config.get("seed", 42)
     set_seed(seed)
     device = get_device(config)
 
-    print(f"\nEvaluating HMST Architecture 1")
-    print(f"Checkpoint: {args.checkpoint}")
-    print(f"Device:     {device}")
-    print(f"Dataset:    {dataset}")
-    print(f"Output dir: {out_dir}")
+    # Resolve evaluation batch size
+    if args.batch_size is not None:
+        if args.batch_size <= 0:
+            raise ValueError(f"Invalid --batch-size {args.batch_size}. Must be a positive integer.")
+        batch_size = args.batch_size
+        batch_source = f"CLI override (--batch-size {batch_size})"
+    else:
+        batch_size = config.get("batch_size")
+        if batch_size is None or not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError(f"Invalid or missing batch_size in config '{cfg_path}': {batch_size}")
+        batch_source = f"Config ({cfg_path})"
+
+    print(f"\n{'='*60}")
+    print(f"Evaluating HMST Architecture 1")
+    print(f"{'='*60}")
+    print(f"Config:      {cfg_path}")
+    print(f"Checkpoint:  {args.checkpoint}")
+    print(f"Backbone:    {backbone}")
+    print(f"Device:      {device}")
+    print(f"Dataset:     {dataset}")
+    print(f"Batch Size:  {batch_size} ({batch_source})")
+    print(f"Output dir:  {out_dir}")
 
     # Dataset
     _, val_ds, test_ds = build_datasets(config, project_root)
-    batch_size = config.get("batch_size", 4)
     num_workers = config.get("num_workers", 0)
 
     test_loader = DataLoader(
@@ -82,28 +147,18 @@ def main():
     )
 
     # Model
-    patch_sizes  = config.get("patch_sizes", [32, 64, 128])
+    patch_sizes = config.get("patch_sizes", [32, 64, 128])
     image_size  = config.get("image_size", 224)
-
-    # Read the checkpoint's stored config so tuned checkpoints load correctly,
-    # and hard-fail if the checkpoint belongs to a different dataset.
-    ckpt_meta = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    ckpt_cfg  = ckpt_meta.get("config", {})
-    ckpt_ds   = ckpt_cfg.get("dataset")
-    if ckpt_ds is not None and ckpt_ds != dataset:
-        raise RuntimeError(
-            f"Checkpoint '{args.checkpoint}' records dataset '{ckpt_ds}' "
-            f"but evaluation is configured for dataset '{dataset}'."
-        )
 
     model = HMST(
         image_size=ckpt_cfg.get("image_size", image_size),
         patch_sizes=ckpt_cfg.get("patch_sizes", patch_sizes),
-        d_model=int(ckpt_cfg.get("d_model", 512)),
-        nhead=int(ckpt_cfg.get("nhead", 8)),
-        nlayers=int(ckpt_cfg.get("nlayers", 2)),
-        n_regions=int(ckpt_cfg.get("n_regions", 4)),
-        dropout=float(ckpt_cfg.get("dropout", 0.3)),
+        d_model=int(ckpt_cfg.get("d_model", config.get("d_model", 512))),
+        nhead=int(ckpt_cfg.get("nhead", config.get("nhead", 8))),
+        nlayers=int(ckpt_cfg.get("nlayers", config.get("nlayers", 2))),
+        n_regions=int(ckpt_cfg.get("n_regions", config.get("n_regions", 4))),
+        dropout=float(ckpt_cfg.get("dropout", config.get("dropout", 0.3))),
+        backbone=backbone,
     ).to(device)
 
     # Load checkpoint weights

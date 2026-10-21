@@ -19,6 +19,7 @@ import random
 import time
 import json
 import csv
+from typing import Optional, Dict, Any, List
 
 # Make the project root importable from scripts/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -85,6 +86,72 @@ def load_config(mode: str) -> dict:
     return config
 
 
+def resolve_config_path(config_arg: str, project_root: str) -> str:
+    """Resolve a configuration file path reliably across CLI working directories."""
+    candidates = [
+        config_arg,
+        os.path.abspath(config_arg),
+        os.path.join(project_root, config_arg),
+        os.path.join(project_root, "configs", config_arg),
+        os.path.join(project_root, "configs", os.path.basename(config_arg)),
+    ]
+    for cand in candidates:
+        if os.path.isfile(cand):
+            return os.path.normpath(cand)
+    raise FileNotFoundError(
+        f"Could not resolve configuration file '{config_arg}'. Checked candidates:\n"
+        + "\n".join(f"  - {c}" for c in candidates)
+    )
+
+
+def validate_training_config(config: dict, cfg_path: str) -> None:
+    """Validate required keys and parameter types in the training configuration."""
+    if not isinstance(config, dict):
+        raise ValueError(f"Configuration file '{cfg_path}' must contain a valid YAML dictionary.")
+
+    # 1. Dataset
+    if "dataset" not in config or not config["dataset"]:
+        raise ValueError(f"Missing required key 'dataset' in config '{cfg_path}'.")
+
+    # 2. Batch size (strict check - no silent fallbacks)
+    batch_size = config.get("batch_size")
+    if batch_size is None:
+        raise ValueError(
+            f"Missing required key 'batch_size' in config '{cfg_path}'. "
+            f"Silent fallback is disabled to prevent experimental inconsistency."
+        )
+    if not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError(f"Invalid 'batch_size' in config '{cfg_path}': expected positive integer, got {batch_size}.")
+
+    # 3. Optimizer
+    opt_cfg = config.get("optimizer")
+    if not isinstance(opt_cfg, dict):
+        raise ValueError(f"Missing or invalid 'optimizer' block in config '{cfg_path}'. Expected dictionary.")
+    if "name" not in opt_cfg:
+        raise ValueError(f"Missing 'optimizer.name' in config '{cfg_path}'.")
+    if "lr" not in opt_cfg:
+        raise ValueError(f"Missing 'optimizer.lr' in config '{cfg_path}'.")
+    try:
+        lr_val = float(opt_cfg["lr"])
+        if lr_val <= 0:
+            raise ValueError()
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid 'optimizer.lr' in config '{cfg_path}': must be positive float, got {opt_cfg.get('lr')}.")
+    if "weight_decay" in opt_cfg:
+        try:
+            wd_val = float(opt_cfg["weight_decay"])
+            if wd_val < 0:
+                raise ValueError()
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid 'optimizer.weight_decay' in config '{cfg_path}': must be >= 0.")
+
+    # 4. Loss
+    loss_cfg = config.get("loss", {})
+    if not isinstance(loss_cfg, dict):
+        raise ValueError(f"Invalid 'loss' block in config '{cfg_path}': expected dictionary.")
+
+
+
 def make_absolute(path: str, base: str) -> str:
     """Make a path absolute relative to base if it isn't already, with fallback resolution."""
     if os.path.isabs(path):
@@ -117,25 +184,29 @@ def make_absolute(path: str, base: str) -> str:
     return resolved
 
 
-def dataset_output_dir(dataset: str, mode: str, project_root: str, iter_suffix: str = "") -> str:
-    """Dataset-scoped output directory: outputs/{dataset}/{mode}{iter_suffix}."""
-    return make_absolute(f"outputs/{dataset}/{mode}{iter_suffix}", project_root)
+def dataset_output_dir(dataset: str, mode: str, project_root: str, iter_suffix: str = "", backbone: str = "resnet50") -> str:
+    """Dataset-scoped output directory. ResNet-50 preserves existing outputs/{dataset}/{mode}{iter_suffix}."""
+    if backbone == "resnet50":
+        return make_absolute(f"outputs/{dataset}/{mode}{iter_suffix}", project_root)
+    return make_absolute(f"outputs/{dataset}_{backbone}/{mode}{iter_suffix}", project_root)
 
 
-def dataset_checkpoint_dir(dataset: str, mode: str, project_root: str, iter_suffix: str = "") -> str:
-    """Dataset-scoped checkpoint directory: checkpoints/{dataset}/{mode}{iter_suffix}."""
-    return make_absolute(f"checkpoints/{dataset}/{mode}{iter_suffix}", project_root)
+def dataset_checkpoint_dir(dataset: str, mode: str, project_root: str, iter_suffix: str = "", backbone: str = "resnet50") -> str:
+    """Dataset-scoped checkpoint directory. ResNet-50 preserves existing checkpoints/{dataset}/{mode}{iter_suffix}."""
+    if backbone == "resnet50":
+        return make_absolute(f"checkpoints/{dataset}/{mode}{iter_suffix}", project_root)
+    return make_absolute(f"checkpoints/{dataset}_{backbone}/{mode}{iter_suffix}", project_root)
 
 
-def write_run_marker(directory: str, dataset: str, mode: str) -> None:
-    """Write run.json identifying the dataset/mode that owns this directory."""
+def write_run_marker(directory: str, dataset: str, mode: str, backbone: str = "resnet50") -> None:
+    """Write run.json identifying the dataset/mode/backbone that owns this directory."""
     os.makedirs(directory, exist_ok=True)
     with open(os.path.join(directory, "run.json"), "w") as f:
-        json.dump({"dataset": dataset, "mode": mode}, f, indent=2)
+        json.dump({"dataset": dataset, "mode": mode, "backbone": backbone}, f, indent=2)
 
 
-def assert_dataset_matches(directory: str, dataset: str) -> None:
-    """Hard-fail if an existing run.json in `directory` belongs to a different dataset."""
+def assert_dataset_matches(directory: str, dataset: str, backbone: str = "resnet50") -> None:
+    """Hard-fail if an existing run.json in `directory` belongs to a different dataset or backbone."""
     marker = os.path.join(directory, "run.json")
     if not os.path.exists(marker):
         return
@@ -147,6 +218,222 @@ def assert_dataset_matches(directory: str, dataset: str) -> None:
             f"'{recorded.get('dataset')}' but current dataset is '{dataset}'. "
             f"Refusing to mix artifacts from different datasets."
         )
+    recorded_bb = recorded.get("backbone", "resnet50")
+    if recorded_bb != backbone:
+        raise RuntimeError(
+            f"Backbone mismatch in '{directory}': run.json records backbone "
+            f"'{recorded_bb}' but current backbone is '{backbone}'. "
+            f"Refusing to mix artifacts from different backbones."
+        )
+
+
+def save_results_for_plotting(
+    project_root: str,
+    backbone: str,
+    dataset: str,
+    iteration: int,
+    iter_seed: int,
+    metrics_tta: dict,
+    metrics_no_tta: dict,
+    history: list,
+    predictions_rows: list,
+    config: dict,
+    best_epoch: Optional[int] = None,
+    best_val_metric: Optional[float] = None,
+    test_sample_count: Optional[int] = None,
+) -> str:
+    """
+    Save results in the standardized directory structure for plotting and backbone comparison:
+    results/
+    ├── {backbone}/
+    │   └── {dataset}/
+    │       └── iteration_{iter:02d}/
+    │           ├── metrics.json
+    │           ├── epoch_history.csv
+    │           └── predictions.csv
+    And update aggregate:
+    results/summary.csv
+    """
+    bb_folder = "convnext_tiny" if backbone == "convnext" else backbone
+    ds_folder = dataset.upper()
+    iter_folder = f"iteration_{iteration:02d}"
+    iter_dir = os.path.join(project_root, "results", bb_folder, ds_folder, iter_folder)
+    os.makedirs(iter_dir, exist_ok=True)
+
+    # 1. metrics.json
+    metrics_data = {
+        "backbone": bb_folder,
+        "dataset": ds_folder,
+        "iteration": iteration,
+        "seed": iter_seed,
+        "best_epoch": best_epoch,
+        "best_val_metric": best_val_metric,
+        "test_sample_count": test_sample_count,
+        "tta": {
+            "srocc": metrics_tta.get("srocc"),
+            "plcc": metrics_tta.get("plcc"),
+            "krcc": metrics_tta.get("krcc"),
+            "rmse": metrics_tta.get("rmse"),
+            "mae": metrics_tta.get("mae"),
+            "medae": metrics_tta.get("medae"),
+        },
+        "no_tta": {
+            "srocc": metrics_no_tta.get("srocc"),
+            "plcc": metrics_no_tta.get("plcc"),
+            "krcc": metrics_no_tta.get("krcc"),
+            "rmse": metrics_no_tta.get("rmse"),
+            "mae": metrics_no_tta.get("mae"),
+            "medae": metrics_no_tta.get("medae"),
+        },
+        "srocc": metrics_tta.get("srocc"),
+        "plcc": metrics_tta.get("plcc"),
+        "krcc": metrics_tta.get("krcc"),
+        "rmse": metrics_tta.get("rmse"),
+        "mae": metrics_tta.get("mae"),
+        "srocc_no_tta": metrics_no_tta.get("srocc"),
+        "plcc_no_tta": metrics_no_tta.get("plcc"),
+        "krcc_no_tta": metrics_no_tta.get("krcc"),
+        "rmse_no_tta": metrics_no_tta.get("rmse"),
+        "mae_no_tta": metrics_no_tta.get("mae"),
+        "config": {
+            "image_size": config.get("image_size"),
+            "patch_sizes": config.get("patch_sizes"),
+            "d_model": config.get("d_model"),
+            "batch_size": config.get("batch_size"),
+            "epochs": config.get("epochs"),
+            "optimizer": config.get("optimizer", {}).get("name"),
+            "lr": config.get("optimizer", {}).get("lr"),
+        },
+    }
+    with open(os.path.join(iter_dir, "metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(metrics_data, f, indent=2)
+
+    # 2. epoch_history.csv
+    if history:
+        keys = list(dict.fromkeys(key for record in history for key in record))
+        with open(os.path.join(iter_dir, "epoch_history.csv"), "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=keys)
+            writer.writeheader()
+            writer.writerows(history)
+
+    # 3. predictions.csv
+    if predictions_rows:
+        pred_csv_path = os.path.join(iter_dir, "predictions.csv")
+        pred_keys = [
+            "image", "actual_mos", "pred_mos_tta", "pred_mos_no_tta",
+            "abs_error_tta", "error_tta", "path", "dataset", "backbone", "iteration"
+        ]
+        with open(pred_csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=pred_keys)
+            writer.writeheader()
+            for r in predictions_rows:
+                row_copy = dict(r)
+                row_copy["dataset"] = ds_folder
+                row_copy["backbone"] = bb_folder
+                row_copy["iteration"] = iteration
+                writer.writerow(row_copy)
+
+    # 4. Update consolidated results/summary.csv
+    results_dir = os.path.join(project_root, "results")
+    os.makedirs(results_dir, exist_ok=True)
+    summary_csv_path = os.path.join(results_dir, "summary.csv")
+
+    summary_row = {
+        "backbone": bb_folder,
+        "dataset": ds_folder,
+        "iteration": iteration,
+        "seed": iter_seed,
+        "srocc_tta": metrics_tta.get("srocc"),
+        "plcc_tta": metrics_tta.get("plcc"),
+        "krcc_tta": metrics_tta.get("krcc"),
+        "rmse_tta": metrics_tta.get("rmse"),
+        "mae_tta": metrics_tta.get("mae"),
+        "srocc_no_tta": metrics_no_tta.get("srocc"),
+        "plcc_no_tta": metrics_no_tta.get("plcc"),
+        "krcc_no_tta": metrics_no_tta.get("krcc"),
+        "rmse_no_tta": metrics_no_tta.get("rmse"),
+        "mae_no_tta": metrics_no_tta.get("mae"),
+        "best_epoch": best_epoch,
+        "best_val_metric": best_val_metric,
+        "test_sample_count": test_sample_count,
+    }
+
+    existing_rows = []
+    if os.path.exists(summary_csv_path):
+        with open(summary_csv_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if not (row.get("backbone") == bb_folder and
+                        row.get("dataset") == ds_folder and
+                        str(row.get("iteration")) == str(iteration)):
+                    existing_rows.append(row)
+
+    existing_rows.append(summary_row)
+    fieldnames = list(summary_row.keys())
+    with open(summary_csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(existing_rows)
+
+    return iter_dir
+
+
+def update_summary_aggregates(project_root: str) -> None:
+    """Compute and save aggregate mean and std per backbone and dataset into results/summary_aggregates.csv."""
+    results_dir = os.path.join(project_root, "results")
+    summary_csv_path = os.path.join(results_dir, "summary.csv")
+    if not os.path.exists(summary_csv_path):
+        return
+
+    rows = []
+    with open(summary_csv_path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            rows.append(r)
+
+    if not rows:
+        return
+
+    groups = {}
+    for r in rows:
+        key = (r["backbone"], r["dataset"])
+        groups.setdefault(key, []).append(r)
+
+    agg_rows = []
+    metric_keys = [
+        "srocc_tta", "plcc_tta", "krcc_tta", "rmse_tta", "mae_tta",
+        "srocc_no_tta", "plcc_no_tta", "krcc_no_tta", "rmse_no_tta", "mae_no_tta"
+    ]
+    for (bb, ds), items in groups.items():
+        n = len(items)
+        row = {"backbone": bb, "dataset": ds, "n_iterations": n}
+        for m in metric_keys:
+            vals = []
+            for item in items:
+                v = item.get(m)
+                if v not in (None, "", "None"):
+                    try:
+                        vals.append(float(v))
+                    except ValueError:
+                        pass
+            if vals:
+                row[f"{m}_mean"] = f"{np.mean(vals):.4f}"
+                row[f"{m}_std"] = f"{np.std(vals):.4f}"
+                row[f"{m}_median"] = f"{np.median(vals):.4f}"
+            else:
+                row[f"{m}_mean"] = ""
+                row[f"{m}_std"] = ""
+                row[f"{m}_median"] = ""
+        agg_rows.append(row)
+
+    if agg_rows:
+        agg_path = os.path.join(results_dir, "summary_aggregates.csv")
+        fieldnames = list(agg_rows[0].keys())
+        with open(agg_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(agg_rows)
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -270,6 +557,10 @@ def main():
         help="Override dataset from config"
     )
     parser.add_argument(
+        "--backbone", type=str, default=None, choices=["resnet50", "convnext", "convnext_tiny"],
+        help="Select backbone architecture: 'resnet50' (default) or 'convnext'"
+    )
+    parser.add_argument(
         "--iterations", type=int, default=1,
         help="Number of iterations to run with random splits"
     )
@@ -284,32 +575,46 @@ def main():
 
     # ── Config ────────────────────────────────────────────────────────────
     if args.config:
-        if os.path.isabs(args.config):
-            cfg_path = args.config
-        elif os.path.exists(args.config):
-            cfg_path = os.path.abspath(args.config)
-        elif os.path.exists(os.path.join(project_root, args.config)):
-            cfg_path = os.path.join(project_root, args.config)
-        elif os.path.exists(os.path.join(project_root, "configs", args.config)):
-            cfg_path = os.path.join(project_root, "configs", args.config)
-        else:
-            cfg_path = os.path.join(project_root, args.config)
-
+        cfg_path = resolve_config_path(args.config, project_root)
         with open(cfg_path, "r") as f:
             config = yaml.safe_load(f)
+        validate_training_config(config, cfg_path)
+        print(f"\n[Config] Successfully loaded and validated custom config: {cfg_path}")
     else:
         config = load_config(args.mode)
+        cfg_path = os.path.normpath(os.path.join(project_root, "configs", f"{args.mode}.yaml"))
+        validate_training_config(config, cfg_path)
     if args.dataset:
         config["dataset"] = args.dataset
 
     mode = config.get("mode", args.mode or "full")
     dataset = config.get("dataset", "uwiqa")
 
+    # ── Determine backbone: CLI flag > config value > default 'resnet50' ───
+    cli_backbone = args.backbone
+    if cli_backbone is not None:
+        selected_backbone = cli_backbone.lower().strip().replace("-", "_")
+        if selected_backbone == "convnext_tiny":
+            selected_backbone = "convnext"
+    else:
+        cfg_backbone = config.get("backbone", "resnet50")
+        selected_backbone = str(cfg_backbone).lower().strip().replace("-", "_")
+        if selected_backbone == "convnext_tiny":
+            selected_backbone = "convnext"
+
+    if selected_backbone not in ("resnet50", "convnext"):
+        raise ValueError(
+            f"Unsupported backbone '{args.backbone or config.get('backbone')}'. "
+            f"Supported values: ['resnet50', 'convnext']"
+        )
+    config["backbone"] = selected_backbone
+    backbone = selected_backbone
+
     # Override resume from CLI
     resume_path = args.resume
     if resume_path is None and config.get("resume", False):
-        default_resume_dir = dataset_checkpoint_dir(dataset, mode, project_root)
-        assert_dataset_matches(default_resume_dir, dataset)
+        default_resume_dir = dataset_checkpoint_dir(dataset, mode, project_root, backbone=backbone)
+        assert_dataset_matches(default_resume_dir, dataset, backbone=backbone)
         default_resume = os.path.join(default_resume_dir, "latest.pt")
         if os.path.exists(default_resume):
             resume_path = default_resume
@@ -328,26 +633,29 @@ def main():
     print(f"\n{'='*60}")
     print(f"HMST Architecture 1 — Training")
     print(f"{'='*60}")
-    print(f"Mode:     {mode}")
-    print(f"Dataset:  {config.get('dataset', 'uwiqa')}")
-    print(f"Device:   {device}")
+    print(f"Config Source: {cfg_path}")
+    print(f"Mode:          {mode}")
+    print(f"Dataset:       {config.get('dataset', 'uwiqa')}")
+    print(f"Backbone:      {backbone}")
+    print(f"Batch Size:    {config['batch_size']}")
+    print(f"Device:        {device}")
     if device.type == "cuda":
-        print(f"GPU:      {torch.cuda.get_device_name(0)}")
-    print(f"PyTorch:  {torch.__version__}")
-    print(f"Seed:     {seed_print}")
+        print(f"GPU:           {torch.cuda.get_device_name(0)}")
+    print(f"PyTorch:       {torch.__version__}")
+    print(f"Seed:          {seed_print}")
 
     all_metrics = []
     all_metrics_no_tta = []
 
     for it in range(num_iterations):
         iter_suffix = f"_iter{it+1}" if num_iterations > 1 else ""
-        checkpoint_dir = dataset_checkpoint_dir(dataset, mode, project_root, iter_suffix)
-        output_dir = dataset_output_dir(dataset, mode, project_root, iter_suffix)
-        # Hard-fail if either dir was previously owned by a different dataset.
-        assert_dataset_matches(checkpoint_dir, dataset)
-        assert_dataset_matches(output_dir, dataset)
-        write_run_marker(checkpoint_dir, dataset, mode)
-        write_run_marker(output_dir, dataset, mode)
+        checkpoint_dir = dataset_checkpoint_dir(dataset, mode, project_root, iter_suffix, backbone=backbone)
+        output_dir = dataset_output_dir(dataset, mode, project_root, iter_suffix, backbone=backbone)
+        # Hard-fail if either dir was previously owned by a different dataset or backbone.
+        assert_dataset_matches(checkpoint_dir, dataset, backbone=backbone)
+        assert_dataset_matches(output_dir, dataset, backbone=backbone)
+        write_run_marker(checkpoint_dir, dataset, mode, backbone=backbone)
+        write_run_marker(output_dir, dataset, mode, backbone=backbone)
         final_path = os.path.join(output_dir, "test_metrics.json")
         std_path = os.path.join(output_dir, "test_metrics_no_tta.json")
 
@@ -432,7 +740,7 @@ def main():
         print(f"  Test:   {len(test_ds)} samples")
 
         num_workers = config.get("num_workers", 0)
-        batch_size  = config.get("batch_size", 4)
+        batch_size  = config["batch_size"]
 
         train_loader = DataLoader(
             train_ds, batch_size=batch_size, shuffle=True,
@@ -447,6 +755,9 @@ def main():
             test_ds, batch_size=batch_size, shuffle=False,
             num_workers=num_workers, pin_memory=(device.type == "cuda"),
         )
+        assert train_loader.batch_size == batch_size, "DataLoader batch size does not match config!"
+        if it == 0:
+            print(f"  DataLoader batch_size: {train_loader.batch_size} (verified from config)")
 
         # ── Model ─────────────────────────────────────────────────────────────
         print(f"\nBuilding HMST model...")
@@ -469,11 +780,13 @@ def main():
             n_regions    = n_regions,
             dropout      = dropout,
             print_shapes = print_shapes if it == 0 else False,
+            backbone     = backbone,
         ).to(device)
 
         if it == 0:
             total_params     = sum(p.numel() for p in model.parameters())
             trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"  Backbone:             {model.backbone_name} (dim={model.BACKBONE_DIM})")
             print(f"  Total parameters:     {total_params:,}")
             print(f"  Trainable parameters: {trainable_params:,}")
 
@@ -504,18 +817,33 @@ def main():
         optimizer = build_optimizer(model, opt_name, lr=lr, weight_decay=wd, **opt_extra)
 
         # ── Scheduler ─────────────────────────────────────────────────────────
-        sched_name = config.get("scheduler", "none")
+        sched_cfg = config.get("scheduler", "none")
         scheduler = None
+        total_epochs = config.get("epochs", 50)
+        if isinstance(sched_cfg, dict):
+            sched_name = sched_cfg.get("name", "none")
+            eta_min_ratio = float(sched_cfg.get("eta_min_ratio", 0.01))
+            step_size = int(sched_cfg.get("step_size", max(5, total_epochs // 3)))
+            gamma = float(sched_cfg.get("gamma", 0.5))
+        else:
+            sched_name = str(sched_cfg).lower() if sched_cfg else "none"
+            eta_min_ratio = 0.01
+            step_size = max(5, total_epochs // 3)
+            gamma = 0.5
+
         if sched_name == "cosine":
-            total_epochs = config.get("epochs", 50)
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=total_epochs, eta_min=lr * 0.01
+                optimizer, T_max=total_epochs, eta_min=lr * eta_min_ratio
             )
         elif sched_name == "step":
-            total_epochs = config.get("epochs", 50)
             scheduler = torch.optim.lr_scheduler.StepLR(
-                optimizer, step_size=max(5, total_epochs // 3), gamma=0.5
+                optimizer, step_size=step_size, gamma=gamma
             )
+
+        if it == 0:
+            print(f"  Optimizer: {opt_name} (lr={lr:.2e}, weight_decay={wd:.2e}, extra={opt_extra})")
+            if scheduler is not None:
+                print(f"  Scheduler: {sched_name} ({sched_cfg})")
 
         # ── Trainer ───────────────────────────────────────────────────────────
         trainer = HMSTTrainer(
@@ -562,10 +890,12 @@ def main():
         from training.metrics import compute_metrics, collect_predictions, collect_predictions_tta
 
         best_ckpt_path = os.path.join(checkpoint_dir, "best.pt")
+        best_epoch = None
         if os.path.exists(best_ckpt_path):
             from training.checkpoint import load_checkpoint
-            load_checkpoint(best_ckpt_path, model, device=device)
-            print(f"Loaded best.pt for final evaluation")
+            best_ckpt = load_checkpoint(best_ckpt_path, model, device=device)
+            best_epoch = best_ckpt.get("epoch")
+            print(f"Loaded best.pt for final evaluation (epoch {best_epoch})")
 
         # ── Standard single-pass evaluation ───────────────────────────────────
         result = collect_predictions(model, test_loader, device)
@@ -698,6 +1028,25 @@ def main():
         print(f"TTA results saved to: {final_path}")
         print(f"Per-image predictions saved to: {pred_csv_path}")
 
+        # ── Save standardized comparison results for plotting (Section 5) ─────
+        saved_iter_dir = save_results_for_plotting(
+            project_root      = project_root,
+            backbone          = backbone,
+            dataset           = dataset,
+            iteration         = it + 1,
+            iter_seed         = iter_seed,
+            metrics_tta       = final_metrics_tta,
+            metrics_no_tta    = final_metrics,
+            history           = trainer.training_history,
+            predictions_rows  = rows,
+            config            = config,
+            best_epoch        = best_epoch,
+            best_val_metric   = getattr(trainer, "best_metric", None),
+            test_sample_count = len(test_ds),
+        )
+        update_summary_aggregates(project_root)
+        print(f"Comparison results saved to: {saved_iter_dir}")
+
         # Quick console highlight: top 3 best and top 3 worst, plus MAE & MedAE
         sorted_by_err = sorted(rows, key=lambda x: x["abs_error_tta"])
         best_3 = sorted_by_err[:min(3, len(sorted_by_err))]
@@ -718,7 +1067,7 @@ def main():
         print(f"{'='*60}\n")
 
     if len(all_metrics) > 0:
-        summary_dir = dataset_output_dir(dataset, mode, project_root)
+        summary_dir = dataset_output_dir(dataset, mode, project_root, backbone=backbone)
         os.makedirs(summary_dir, exist_ok=True)
 
         print(f"\n{'='*65}")
@@ -800,7 +1149,7 @@ def main():
 
         # Persist consolidated copies of the best iteration's artifacts
         best_iter_suffix = f"_iter{best_iter}" if num_iterations > 1 else ""
-        best_src_dir = dataset_output_dir(dataset, mode, project_root, best_iter_suffix)
+        best_src_dir = dataset_output_dir(dataset, mode, project_root, best_iter_suffix, backbone=backbone)
         import shutil
         best_pred_src = os.path.join(best_src_dir, "test_predictions.csv")
         best_pred_dst = os.path.join(summary_dir, "best_iteration_predictions.csv")
@@ -813,9 +1162,9 @@ def main():
         print(f"  Best metrics JSON -> {best_metric_dst}")
         print(f"{'='*65}\n")
 
-        # ── Top-10 Summary (when running > 10 iterations, e.g. 15) ──────────
-        if len(all_metrics) > 10:
-            top_k = 10
+        # ── Top-10 Summary (when running >= 10 iterations, e.g. 25) ──────────
+        if len(all_metrics) >= 10:
+            top_k = min(10, len(all_metrics))
 
             # 1. Top-k for TTA
             sorted_by_srocc = sorted(all_metrics, key=lambda m: m["srocc"], reverse=True)
@@ -840,7 +1189,7 @@ def main():
                 }
             }
 
-            if has_no_tta and len(all_metrics_no_tta) > 10:
+            if has_no_tta and len(all_metrics_no_tta) >= 10:
                 # 2. Top-k for Single View (No TTA)
                 sorted_by_srocc_raw = sorted(all_metrics_no_tta, key=lambda m: m["srocc"], reverse=True)
                 top_metrics_raw = sorted_by_srocc_raw[:top_k]
@@ -872,6 +1221,14 @@ def main():
                 print(f"  {'KRCC:':<8}  {t_med_krcc_raw:.4f} (Mean: {t_mean_krcc_raw:.4f}±{t_std_krcc_raw:.4f})   {t_med_krcc:.4f} (Mean: {t_mean_krcc:.4f}±{t_std_krcc:.4f})")
                 print(f"  {'RMSE:':<8}  {t_med_rmse_raw:.4f} (Mean: {t_mean_rmse_raw:.4f}±{t_std_rmse_raw:.4f})   {t_med_rmse:.4f} (Mean: {t_mean_rmse:.4f}±{t_std_rmse:.4f})")
                 print(f"{'='*65}\n")
+
+                # Save Top-10 No-TTA iterations to CSV
+                top10_notta_csv = os.path.join(summary_dir, f"top_{top_k}_iterations_no_tta.csv")
+                with open(top10_notta_csv, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=list(top_metrics_raw[0].keys()))
+                    writer.writeheader()
+                    writer.writerows(top_metrics_raw)
+                print(f"Top {top_k} No-TTA iterations CSV saved to: {top10_notta_csv}")
             else:
                 print(f"{'='*60}")
                 print(f"TOP {top_k} BEST ITERATIONS SUMMARY (Ranked by SROCC out of {len(all_metrics)})")
@@ -884,10 +1241,19 @@ def main():
                 print(f"  RMSE:        {t_med_rmse:.4f}       {t_mean_rmse:.4f}      (±{t_std_rmse:.4f})  [4-param logistic]")
                 print(f"{'='*60}\n")
 
+            # Save Top-10 TTA iterations to CSV
+            top10_tta_csv = os.path.join(summary_dir, f"top_{top_k}_iterations_tta.csv")
+            with open(top10_tta_csv, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(top_metrics[0].keys()))
+                writer.writeheader()
+                writer.writerows(top_metrics)
+            print(f"Top {top_k} TTA iterations CSV saved to: {top10_tta_csv}")
+
         summary_file = os.path.join(summary_dir, f"{num_iterations}_iterations_summary.json")
         with open(summary_file, "w") as f:
             json.dump(summary_data, f, indent=2)
         print(f"Full benchmark summary saved to: {summary_file}\n")
+        update_summary_aggregates(project_root)
 
 
 if __name__ == "__main__":

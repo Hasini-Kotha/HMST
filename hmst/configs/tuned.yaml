@@ -30,7 +30,7 @@ dropout: 0.11718134709494396
 # ── Training settings ────────────────────────────────────────
 epochs: 50
 min_epochs: 15
-batch_size: 4
+batch_size: 8
 num_workers: 4
 
 early_stopping:

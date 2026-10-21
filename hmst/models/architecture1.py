@@ -52,6 +52,8 @@ from typing import List, Tuple, Dict, Optional
 
 import torchvision.models as tv_models
 
+from .convnext_backbone import ConvNeXtTinyBackbone, CONVNEXT_TINY_DIM
+
 from .modules import (
     MultiScalePatchExtractor,
     LocalQualityHead,
@@ -75,9 +77,18 @@ class HMST(nn.Module):
         n_regions:    Number of hierarchical pooling regions per scale (4)
         dropout:      Dropout rate (0.1)
         print_shapes: Print tensor shapes for debugging (test mode)
+        backbone:     Backbone name: 'resnet50' (default) | 'convnext'
+                      - 'resnet50'  → pretrained ResNet-50, output dim 2048
+                      - 'convnext'  → pretrained ConvNeXt-Tiny, output dim 768
     """
 
-    # Backbone output feature dimension (ResNet-50 avgpool output)
+    # Supported backbone names and their output dimensions
+    _BACKBONE_DIMS = {
+        "resnet50": 2048,
+        "convnext": CONVNEXT_TINY_DIM,  # 768
+    }
+
+    # Kept for backward compatibility (default: ResNet-50)
     BACKBONE_DIM = 2048
 
     def __init__(
@@ -90,8 +101,20 @@ class HMST(nn.Module):
         n_regions: int = 4,
         dropout: float = 0.1,
         print_shapes: bool = False,
+        backbone: str = "resnet50",
     ):
         super().__init__()
+
+        # ── Validate backbone selection ────────────────────────────────────
+        backbone_key = backbone.lower().strip().replace("-", "_")
+        if backbone_key == "convnext_tiny":
+            backbone_key = "convnext"
+        if backbone_key not in self._BACKBONE_DIMS:
+            raise ValueError(
+                f"Unsupported backbone '{backbone}'. "
+                f"Supported values: {sorted(self._BACKBONE_DIMS.keys())}"
+            )
+        self.backbone_name = backbone_key
 
         self.image_size = image_size
         self.patch_sizes = patch_sizes
@@ -104,15 +127,25 @@ class HMST(nn.Module):
         self.grid_sizes = self.patch_extractor.grid_sizes  # [7, 3, 1]
         self.num_patches = self.patch_extractor.num_patches  # [49, 9, 1]
 
-        # ── Backbone: ResNet-50 (shared, pretrained ImageNet) ─────────────
-        # ResNet-50 shared backbone (§2.3 of Underwater_ideas.pdf lists ResNet as candidate)
-        backbone = tv_models.resnet50(weights=tv_models.ResNet50_Weights.IMAGENET1K_V1)
-        # Remove the final FC layer — keep avgpool which gives [2048]
-        self.backbone = nn.Sequential(*list(backbone.children())[:-1])
-        # backbone output: [B*N, 2048, 1, 1]
+        # ── Backbone: selected pretrained backbone (shared across all patches) ─
+        if backbone_key == "convnext":
+            # ConvNeXt-Tiny pretrained on ImageNet-1K
+            # Output: [B*N, 768]  (after built-in AdaptiveAvgPool2d + flatten)
+            self.backbone = ConvNeXtTinyBackbone()
+            self.BACKBONE_DIM = CONVNEXT_TINY_DIM  # 768
+        else:
+            # ResNet-50 pretrained on ImageNet-1K — default, unchanged path
+            # (§2.3 of Underwater_ideas.pdf lists ResNet as candidate)
+            _rn = tv_models.resnet50(weights=tv_models.ResNet50_Weights.IMAGENET1K_V1)
+            # Remove the final FC layer — keep avgpool which gives [2048]
+            self.backbone = nn.Sequential(*list(_rn.children())[:-1])
+            # backbone output: [B*N, 2048, 1, 1]
+            self.BACKBONE_DIM = 2048
 
-        # ── Feature projection: 2048 → d_model ───────────────────────────
-        # One shared projector across all scales
+        # ── Feature projection: BACKBONE_DIM → d_model ────────────────────
+        # One shared projector across all scales.
+        # For resnet50:  Linear(2048 → d_model)
+        # For convnext:  Linear(768  → d_model)
         self.feat_proj = nn.Linear(self.BACKBONE_DIM, d_model)
 
         # ── §4.3  Scale-specific quality heads (one per scale) ────────────
@@ -149,7 +182,11 @@ class HMST(nn.Module):
 
     def _extract_patch_features(self, patches: torch.Tensor) -> torch.Tensor:
         """
-        Run the shared ResNet-50 backbone on all patches of one scale.
+        Run the shared backbone on all patches of one scale.
+
+        Works for both backbone variants:
+          - resnet50:  backbone returns [B*N, 2048, 1, 1], needs .view to flatten
+          - convnext:  ConvNeXtTinyBackbone.forward() already returns [B*N, 768]
 
         Args:
             patches: [B, N, C, ps, ps]
@@ -162,14 +199,19 @@ class HMST(nn.Module):
         # Reshape to [B*N, C, ps, ps] for batch processing
         flat = patches.view(B * N, C, ps, ps)
 
-        # Backbone expects images ≥ 32×32 (ResNet-50 can handle 32×32 fine)
+        # Backbone expects images ≥ 32×32 (both backbones handle 32×32 fine)
         # If ps < 32, upsample (not needed here since min ps=32)
         if ps < 32:
             flat = F.interpolate(flat, size=32, mode="bilinear", align_corners=False)
 
-        # ResNet-50 backbone → [B*N, 2048, 1, 1]
-        feat = self.backbone(flat)
-        feat = feat.view(B * N, self.BACKBONE_DIM)  # [B*N, 2048]
+        # Run backbone
+        if self.backbone_name == "convnext":
+            # ConvNeXtTinyBackbone.forward() returns [B*N, 768] directly
+            feat = self.backbone(flat)               # [B*N, 768]
+        else:
+            # ResNet-50 backbone → [B*N, 2048, 1, 1] — unchanged original path
+            feat = self.backbone(flat)
+            feat = feat.view(B * N, self.BACKBONE_DIM)  # [B*N, 2048]
 
         # Project to d_model
         feat = self.feat_proj(feat)                  # [B*N, d_model]
@@ -199,6 +241,7 @@ class HMST(nn.Module):
         if dbg:
             self.print_shapes = False  # Only print shapes once to avoid spamming terminal on every batch
             print(f"\n{'='*60}")
+            print(f"[HMST] Backbone:       {self.backbone_name} (dim={self.BACKBONE_DIM})")
             print(f"[HMST] Input:          {list(x.shape)}")
 
         # ── §4.2  Multi-Scale Patch Extraction ────────────────────────────

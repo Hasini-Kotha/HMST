@@ -5,16 +5,24 @@ Hyperparameter Tuning for HMST on UWIQA (or SAUD) using Optuna.
 
 Features:
 - Search space: Modern optimizers (Lion, SAM-AdamW, AdamW, Adam, SGD),
-  learning rate, weight decay, batch size, loss weights, ranking margin,
-  dropout, transformer depth/width, and augmentations.
+  learning rate, weight decay, batch size ([8, 16, 32]), loss weights,
+  ranking margin, dropout, transformer depth/width, and augmentations.
+- Backbone selection: ResNet-50 (default) or ConvNeXt-Tiny.
 - Bayesian Optimization via TPESampler.
 - Aggressive pruning via MedianPruner to terminate unpromising trials early.
-- SQLite study persistence (resumeable, pauseable, inspectable via optuna-dashboard).
-- Automatically exports the winning parameters to configs/uwiqa_tuned.yaml.
+- Robust CUDA OOM handling (gracefully prunes unviable batch sizes without crashing).
+- Non-finite (NaN) metric guards to prevent sampler corruption.
+- Safe SQLite study persistence and migration: preserves historical databases
+  while enforcing search-space consistency.
+- Comprehensive configuration export: exports batch size, optimizer kwargs
+  (momentum, nesterov, rho), scheduler parameters, loss weights, and architecture.
 
 Usage:
-    # Run 30 trials on UWIQA
+    # Run 30 trials on UWIQA (default ResNet-50)
     python scripts/tune_optuna.py --trials 30 --epochs 25
+
+    # Run on UWIQA with ConvNeXt-Tiny backbone
+    python scripts/tune_optuna.py --trials 30 --epochs 25 --backbone convnext
 
     # Run with custom storage
     python scripts/tune_optuna.py --trials 50 --storage sqlite:///outputs/uwiqa/optuna/uwiqa_study.db
@@ -25,6 +33,7 @@ Usage:
 
 import os
 import sys
+import gc
 import argparse
 import random
 import time
@@ -61,6 +70,9 @@ from data import (
 )
 from models import HMST, HMSTLoss, build_correspondence_matrix
 from training import compute_metrics, build_optimizer, SAM
+
+
+ALLOWED_BATCH_SIZES = [8, 16, 32]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -115,6 +127,14 @@ class Objective:
         self.project_root = project_root
         self.device = get_device(args.device)
 
+        # Backbone selection: normalize 'convnext_tiny' -> 'convnext'
+        bb = args.backbone.lower().strip().replace("-", "_")
+        if bb == "convnext_tiny":
+            bb = "convnext"
+        if bb not in ("resnet50", "convnext"):
+            raise ValueError(f"Unsupported backbone: {args.backbone}. Must be 'resnet50' or 'convnext'.")
+        self.backbone = bb
+
         # Load base configuration template
         config_path = os.path.join(project_root, "configs", "full.yaml")
         with open(config_path, "r") as f:
@@ -148,8 +168,9 @@ class Objective:
             raise ValueError(f"Unsupported dataset: {self.dataset_name}")
 
     def __call__(self, trial: optuna.Trial) -> float:
-        # Seed this trial run
-        set_seed(self.args.seed)
+        # Seed this trial run with a deterministic trial-specific seed
+        trial_seed = self.args.seed + trial.number
+        set_seed(trial_seed)
 
         # ── 1. Suggest Hyperparameters ─────────────────────────────────────────
         # Optimizer selection
@@ -180,7 +201,7 @@ class Objective:
             rho = trial.suggest_float("rho_sam", 0.01, 0.05)
             opt_kwargs = {"rho": rho}
 
-        batch_size = trial.suggest_categorical("batch_size", [8, 16, 32])
+        batch_size = trial.suggest_categorical("batch_size", ALLOWED_BATCH_SIZES)
         scheduler_name = trial.suggest_categorical("scheduler", ["none", "cosine", "step"])
 
         # Loss weights
@@ -240,6 +261,7 @@ class Objective:
             n_regions=4,
             dropout=dropout,
             print_shapes=False,
+            backbone=self.backbone,
         ).to(self.device)
 
         M = build_correspondence_matrix(
@@ -341,8 +363,13 @@ class Objective:
                 preds = np.concatenate(preds_list)
                 tgts = np.concatenate(tgts_list)
                 metrics = compute_metrics(preds, tgts)
-                val_srocc = float(metrics["srocc"])
-                val_plcc = float(metrics["plcc"])
+                raw_srocc = float(metrics["srocc"])
+
+                # Guard against undefined or non-finite validation metrics (e.g., constant outputs)
+                if not np.isfinite(raw_srocc) or np.isnan(raw_srocc):
+                    val_srocc = -1.0
+                else:
+                    val_srocc = raw_srocc
 
                 # Primary target metric
                 trial_metric = val_srocc
@@ -357,19 +384,104 @@ class Objective:
 
                 # Check if trial should be pruned
                 if trial.should_prune():
-                    raise optuna.TrialPruned()
+                    raise optuna.TrialPruned(f"Trial pruned at epoch {epoch} by MedianPruner.")
 
                 # Early stopping inside trial
                 if patience_counter >= patience and epoch >= 10:
                     break
 
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            err_msg = str(e)
+            if "out of memory" in err_msg.lower():
+                print(f"\n[Trial #{trial.number}] CUDA Out of Memory with batch_size={batch_size}. Pruning trial safely...")
+                del model, optimizer, train_loader, val_loader
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                raise optuna.TrialPruned(f"CUDA OOM with batch_size={batch_size}")
+            raise e
+
         finally:
             # Prevent CUDA memory accumulation across trials
-            del model, optimizer, train_loader, val_loader
+            try:
+                del model, optimizer, train_loader, val_loader
+            except Exception:
+                pass
+            gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        if not np.isfinite(best_val_srocc) or best_val_srocc <= -1.0:
+            raise optuna.TrialPruned("All validation epochs produced non-finite or invalid SROCC.")
+
         return best_val_srocc
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Study Management & Safe Migration
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_or_migrate_study(
+    study_name: str,
+    storage_url: str,
+    sampler: optuna.samplers.BaseSampler,
+    pruner: optuna.pruners.BasePruner,
+) -> optuna.Study:
+    """
+    Safely load an existing study or create a new one.
+
+    If an existing study is loaded via load_if_exists=True, checks whether any
+    completed trials contain parameters outside the current search space (e.g. batch_size not in [8, 16, 32]).
+    If incompatible historical trials are found:
+      - Historical data is PRESERVED intact in the SQLite database.
+      - A new versioned study (e.g. {study_name}_v2) is automatically created/used.
+    """
+    study = optuna.create_study(
+        study_name=study_name,
+        storage=storage_url,
+        direction="maximize",
+        sampler=sampler,
+        pruner=pruner,
+        load_if_exists=True,
+    )
+
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    incompatible = [
+        t for t in completed
+        if t.params.get("batch_size") not in ALLOWED_BATCH_SIZES
+    ]
+
+    if not incompatible:
+        return study
+
+    print(f"\n[Study Compatibility Notice]")
+    print(f"Study '{study_name}' contains {len(incompatible)} trial(s) with batch_size not in {ALLOWED_BATCH_SIZES}.")
+    print(f"Historical trials (e.g. trial #{incompatible[0].number} with batch_size={incompatible[0].params.get('batch_size')})")
+    print(f"are preserved in the database ({storage_url}).")
+    print(f"To ensure search-space integrity, safely migrating to a versioned study name.\n")
+
+    version = 2
+    while True:
+        candidate_name = f"{study_name}_v{version}"
+        try:
+            cand_study = optuna.load_study(study_name=candidate_name, storage=storage_url)
+            cand_completed = [t for t in cand_study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+            cand_incomp = [t for t in cand_completed if t.params.get("batch_size") not in ALLOWED_BATCH_SIZES]
+            if not cand_incomp:
+                print(f"[Safe Migration] Reusing clean versioned study: '{candidate_name}'")
+                cand_study.sampler = sampler
+                cand_study.pruner = pruner
+                return cand_study
+            version += 1
+        except (KeyError, Exception):
+            print(f"[Safe Migration] Initialized clean compatible study: '{candidate_name}'")
+            return optuna.create_study(
+                study_name=candidate_name,
+                storage=storage_url,
+                direction="maximize",
+                sampler=sampler,
+                pruner=pruner,
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -382,6 +494,9 @@ def main():
     parser.add_argument("--epochs", type=int, default=25, help="Max epochs per trial")
     parser.add_argument("--patience", type=int, default=8, help="Early stopping patience per trial")
     parser.add_argument("--dataset", type=str, default="uwiqa", choices=["uwiqa", "saud"])
+    parser.add_argument("--backbone", type=str, default="resnet50",
+                        choices=["resnet50", "convnext", "convnext_tiny"],
+                        help="Backbone architecture: 'resnet50' (default) or 'convnext'")
     parser.add_argument("--device", type=str, default="auto", help="auto | cuda | cpu")
     parser.add_argument("--workers", type=int, default=4, help="DataLoader num_workers")
     parser.add_argument("--seed", type=int, default=42, help="Seed for split consistency")
@@ -420,9 +535,11 @@ def main():
     print(f"HMST Hyperparameter Tuning with Optuna")
     print(f"{'='*70}")
     print(f"Dataset:       {args.dataset.upper()}")
+    print(f"Backbone:      {args.backbone}")
+    print(f"Search Space:  Batch Sizes {ALLOWED_BATCH_SIZES}")
     print(f"Total Trials:  {args.trials}")
     print(f"Epochs/Trial:  {args.epochs} (patience={args.patience})")
-    print(f"Study Name:    {args.study_name}")
+    print(f"Initial Study: {args.study_name}")
     print(f"Storage:       {storage_url}")
     print(f"Output Config: {args.output_config}")
     print(f"{'='*70}\n")
@@ -431,14 +548,13 @@ def main():
     sampler = TPESampler(seed=args.seed)
     pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=8, interval_steps=1)
 
-    study = optuna.create_study(
+    study = get_or_migrate_study(
         study_name=args.study_name,
-        storage=storage_url,
-        direction="maximize",
+        storage_url=storage_url,
         sampler=sampler,
         pruner=pruner,
-        load_if_exists=True,
     )
+    active_study_name = study.study_name
 
     objective = Objective(args, project_root)
 
@@ -458,15 +574,30 @@ def main():
     print(f"TUNING FINISHED in {total_time/60:.1f} minutes")
     print(f"{'='*70}")
 
-    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
-    if not completed_trials:
-        print("\n[Tuning] No trials were successfully completed yet.")
-        print("Run the command again to continue sampling trials into the study database.")
+    # Filter completed trials that belong strictly to ALLOWED_BATCH_SIZES and have valid finite scores
+    valid_completed_trials = [
+        t for t in study.trials
+        if t.state == optuna.trial.TrialState.COMPLETE
+        and t.params.get("batch_size") in ALLOWED_BATCH_SIZES
+        and t.value is not None
+        and np.isfinite(t.value)
+    ]
+
+    if not valid_completed_trials:
+        print("\n[Tuning] No trials matching the current search space were successfully completed.")
+        print(f"Allowed batch sizes: {ALLOWED_BATCH_SIZES}")
+        print("Run the command again to sample more trials.")
         return
 
-    best_trial = study.best_trial
-    print(f"\n★ Best Trial #{best_trial.number}")
-    print(f"  Validation SROCC: {best_trial.value:.4f}")
+    best_trial = max(valid_completed_trials, key=lambda t: t.value)
+    best_batch_size = int(best_trial.params["batch_size"])
+    assert best_batch_size in ALLOWED_BATCH_SIZES, (
+        f"Export error: Best trial batch_size {best_batch_size} not in allowed search space {ALLOWED_BATCH_SIZES}!"
+    )
+
+    print(f"\n★ Best Trial #{best_trial.number} (from study '{active_study_name}')")
+    print(f"  Validation SROCC:      {best_trial.value:.4f}")
+    print(f"  Exported Batch Size:   {best_batch_size} (Allowed: {ALLOWED_BATCH_SIZES})")
     print(f"\nBest Parameters:")
     for k, v in best_trial.params.items():
         print(f"  {k:18s}: {v}")
@@ -475,26 +606,59 @@ def main():
     p = best_trial.params
     opt_type = p["optimizer"]
     if opt_type == "lion":
-        best_lr = p["lr_lion"]
-        best_wd = p["wd_lion"]
+        best_lr = float(p["lr_lion"])
+        best_wd = float(p["wd_lion"])
+        opt_dict = {"name": "lion", "lr": best_lr, "weight_decay": best_wd}
     elif opt_type == "adamw":
-        best_lr = p["lr_adamw"]
-        best_wd = p["wd_adamw"]
+        best_lr = float(p["lr_adamw"])
+        best_wd = float(p["wd_adamw"])
+        opt_dict = {"name": "adamw", "lr": best_lr, "weight_decay": best_wd}
     elif opt_type == "adam":
-        best_lr = p["lr_adam"]
-        best_wd = p["wd_adam"]
+        best_lr = float(p["lr_adam"])
+        best_wd = float(p["wd_adam"])
+        opt_dict = {"name": "adam", "lr": best_lr, "weight_decay": best_wd}
     elif opt_type == "sgd":
-        best_lr = p["lr_sgd"]
-        best_wd = p["wd_sgd"]
+        best_lr = float(p["lr_sgd"])
+        best_wd = float(p["wd_sgd"])
+        opt_dict = {
+            "name": "sgd",
+            "lr": best_lr,
+            "weight_decay": best_wd,
+            "momentum": 0.9,
+            "nesterov": True,
+        }
     elif opt_type == "sam_adamw":
-        best_lr = p["lr_sam"]
-        best_wd = p["wd_sam"]
+        best_lr = float(p["lr_sam"])
+        best_wd = float(p["wd_sam"])
+        rho = float(p["rho_sam"])
+        opt_dict = {
+            "name": "sam_adamw",
+            "lr": best_lr,
+            "weight_decay": best_wd,
+            "rho": rho,
+        }
     else:
         best_lr = 1e-4
         best_wd = 1e-4
+        opt_dict = {"name": opt_type, "lr": best_lr, "weight_decay": best_wd}
 
-    # Pull both dataset path blocks from full.yaml so the exported config is
-    # valid for either dataset (previously only `uwiqa` was written, even for saud).
+    # Scheduler configuration
+    sched_name = p.get("scheduler", "none")
+    if sched_name == "cosine":
+        sched_dict = {
+            "name": "cosine",
+            "eta_min_ratio": 0.01,
+        }
+    elif sched_name == "step":
+        sched_dict = {
+            "name": "step",
+            "step_size": max(5, args.epochs // 3),
+            "gamma": 0.5,
+        }
+    else:
+        sched_dict = "none"
+
+    # Pull base dataset configs from full.yaml
     base_cfg_path = os.path.join(project_root, "configs", "full.yaml")
     with open(base_cfg_path, "r") as f:
         base_cfg = yaml.safe_load(f)
@@ -502,29 +666,26 @@ def main():
     tuned_config = {
         "mode": "tuned",
         "dataset": dataset,
+        "backbone": objective.backbone,
         "seed": args.seed,
         "image_size": 224,
         "patch_sizes": [32, 64, 128],
         "d_model": int(p["d_model"]),
         "nlayers": int(p["nlayers"]),
-        "nhead": 8 if p["d_model"] == 512 else 4,
+        "nhead": 8 if int(p["d_model"]) == 512 else 4,
         "dropout": float(p["dropout"]),
         "epochs": 50,
         "min_epochs": 15,
-        "batch_size": int(p["batch_size"]),
+        "batch_size": best_batch_size,
         "num_workers": args.workers,
         "early_stopping": {
             "monitor": "srocc",
             "mode": "max",
-            "patience": 15,
-            "min_delta": 0.001,
+            "patience": 20,
+            "min_delta": 0.0005,
         },
-        "optimizer": {
-            "name": opt_type,
-            "lr": float(best_lr),
-            "weight_decay": float(best_wd),
-        },
-        "scheduler": p.get("scheduler", "none"),
+        "optimizer": opt_dict,
+        "scheduler": sched_dict,
         "loss": {
             "lambda_mos": 1.0,
             "lambda_rank": float(p["lambda_rank"]),
@@ -546,7 +707,7 @@ def main():
             "benchmark_dir": "../SAUD/Benchmark",
             "bt_scores_mat": "../SAUD/sub_bt_scores.mat",
         }),
-        "checkpoint_dir": f"checkpoints/{dataset}/{args.study_name}",
+        "checkpoint_dir": f"checkpoints/{dataset}/{active_study_name}",
         "checkpoint": {
             "save_best_on": "srocc",
             "mode": "max",
@@ -562,18 +723,24 @@ def main():
         yaml.dump(tuned_config, f, default_flow_style=False, sort_keys=False)
 
     print(f"\n[Saved] Tuned configuration written to: {out_cfg_path}")
+    print(f"[Verification] Confirmed exported batch_size={tuned_config['batch_size']} in {ALLOWED_BATCH_SIZES}")
 
     # Save summary json
-    summary_path = os.path.join(optuna_dir, f"{args.study_name}_summary.json")
+    summary_path = os.path.join(optuna_dir, f"{active_study_name}_summary.json")
     with open(summary_path, "w") as f:
         json.dump(
             {
                 "dataset": dataset,
+                "study_name": active_study_name,
+                "backbone": objective.backbone,
                 "best_trial_number": best_trial.number,
                 "best_val_srocc": best_trial.value,
+                "best_batch_size": best_batch_size,
                 "best_params": best_trial.params,
-                "total_trials": len(study.trials),
+                "total_study_trials": len(study.trials),
+                "valid_completed_trials": len(valid_completed_trials),
                 "duration_minutes": total_time / 60,
+                "output_config": args.output_config,
             },
             f,
             indent=2,
@@ -584,7 +751,9 @@ def main():
     print("NEXT STEPS:")
     print(f"1. To run final 10-iteration training with these tuned settings:")
     print(f"   python scripts/train.py --config {args.output_config} --iterations 10")
-    print(f"2. To inspect the interactive Optuna web dashboard:")
+    print(f"2. To evaluate resulting checkpoint:")
+    print(f"   python scripts/evaluate.py --config {args.output_config} --checkpoint <path_to_best.pt>")
+    print(f"3. To inspect the interactive Optuna web dashboard:")
     print(f"   optuna-dashboard {storage_url}")
     print(f"{'='*70}\n")
 

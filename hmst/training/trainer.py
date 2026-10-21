@@ -40,6 +40,7 @@ from torch.amp import GradScaler, autocast
 from training.metrics import compute_metrics, collect_predictions
 from training.checkpoint import save_checkpoint, load_checkpoint
 from training.plots import save_training_dynamics_plots
+from training.optimizers import SAM
 
 
 class HMSTTrainer:
@@ -97,8 +98,11 @@ class HMSTTrainer:
         self.start_epoch = 0
         self.epochs = config.get("epochs", 50)
 
-        # AMP scaler — only if mixed_precision and CUDA available
-        self.use_amp = config.get("mixed_precision", False) and device.type == "cuda"
+        # Optimizer type inspection (e.g. SAM requires dual-pass forward/backward)
+        self.is_sam = isinstance(optimizer, SAM)
+
+        # AMP scaler — only if mixed_precision and CUDA available (and not SAM)
+        self.use_amp = config.get("mixed_precision", False) and device.type == "cuda" and not self.is_sam
         self.scaler = GradScaler("cuda") if self.use_amp else None
 
     def _train_epoch(self, dataloader: DataLoader) -> Dict[str, float]:
@@ -113,9 +117,19 @@ class HMSTTrainer:
             images = batch["image"].to(self.device)
             scores = batch["score"].to(self.device)
 
-            self.optimizer.zero_grad()
+            if self.is_sam:
+                self.optimizer.zero_grad()
+                output = self.model(images)
+                loss_dict = self.criterion(output, scores)
+                loss_dict["loss"].backward()
+                self.optimizer.first_step(zero_grad=True)
 
-            if self.use_amp:
+                output2 = self.model(images)
+                loss_dict2 = self.criterion(output2, scores)
+                loss_dict2["loss"].backward()
+                self.optimizer.second_step(zero_grad=True)
+            elif self.use_amp:
+                self.optimizer.zero_grad()
                 with autocast("cuda"):
                     output = self.model(images)
                     loss_dict = self.criterion(output, scores)
@@ -123,6 +137,7 @@ class HMSTTrainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
+                self.optimizer.zero_grad()
                 output = self.model(images)
                 loss_dict = self.criterion(output, scores)
                 loss_dict["loss"].backward()

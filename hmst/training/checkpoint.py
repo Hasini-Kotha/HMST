@@ -90,6 +90,20 @@ def load_checkpoint(
 
     checkpoint = torch.load(path, map_location=device, weights_only=False)
 
+    # Validate backbone compatibility
+    ckpt_bb = checkpoint.get("config", {}).get("backbone", "resnet50")
+    if ckpt_bb:
+        ckpt_bb = ckpt_bb.lower().strip().replace("-", "_")
+        if ckpt_bb == "convnext_tiny":
+            ckpt_bb = "convnext"
+    model_bb = getattr(model, "backbone_name", None)
+    if model_bb is not None and ckpt_bb is not None and model_bb != ckpt_bb:
+        raise RuntimeError(
+            f"Backbone mismatch: Checkpoint '{path}' was trained with backbone '{ckpt_bb}', "
+            f"but current model uses backbone '{model_bb}'. "
+            f"Cannot cross-load checkpoints between different backbones."
+        )
+
     model.load_state_dict(checkpoint["model_state_dict"])
 
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
