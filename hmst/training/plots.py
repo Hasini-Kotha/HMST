@@ -73,11 +73,12 @@ def _add_identity_line(axis, low: float, high: float) -> None:
 
 
 def _annotate_metrics(axis, metrics: Dict[str, float]) -> None:
+    calibration_label = "raw" if "same_split_fitted_plcc" in metrics else "4PL"
     text = (
-        f"PLCC  {metrics['plcc']:.4f}\n"
+        f"PLCC ({calibration_label}) {metrics['plcc']:.4f}\n"
         f"SROCC {metrics['srocc']:.4f}\n"
         f"KRCC  {metrics['krcc']:.4f}\n"
-        f"RMSE  {metrics['rmse']:.4f}"
+        f"RMSE ({calibration_label}) {metrics['rmse']:.4f}"
     )
     axis.text(
         0.04, 0.96, text, transform=axis.transAxes, va="top", ha="left",

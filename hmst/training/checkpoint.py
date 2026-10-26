@@ -19,6 +19,7 @@ import os
 import random
 import torch
 import numpy as np
+import warnings
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -31,6 +32,9 @@ def save_checkpoint(
     best_metric: float,
     training_history: list,
     config: dict,
+    scheduler: Optional[Any] = None,
+    scaler: Optional[Any] = None,
+    trainer_state: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Save a training checkpoint.
@@ -61,7 +65,12 @@ def save_checkpoint(
         "training_history":     training_history,
         "config":               config,
         "random_state":         random_state,
+        "trainer_state":        trainer_state or {},
     }
+    if scheduler is not None:
+        checkpoint["scheduler_state_dict"] = scheduler.state_dict()
+    if scaler is not None:
+        checkpoint["scaler_state_dict"] = scaler.state_dict()
 
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, path)
@@ -72,6 +81,9 @@ def load_checkpoint(
     model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
     device: Optional[torch.device] = None,
+    scheduler: Optional[Any] = None,
+    scaler: Optional[Any] = None,
+    expected_dataset: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Load a checkpoint and restore model/optimizer state.
@@ -104,10 +116,32 @@ def load_checkpoint(
             f"Cannot cross-load checkpoints between different backbones."
         )
 
+    if expected_dataset is not None:
+        checkpoint_dataset = checkpoint.get("config", {}).get("dataset")
+        if checkpoint_dataset != expected_dataset:
+            raise RuntimeError(
+                f"Dataset mismatch: Checkpoint '{path}' was trained with dataset "
+                f"'{checkpoint_dataset}', but the current run uses '{expected_dataset}'. "
+                "Refusing to resume across datasets."
+            )
+
     model.load_state_dict(checkpoint["model_state_dict"])
 
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    if optimizer is not None and scheduler is not None:
+        scheduler_state = checkpoint.get("scheduler_state_dict")
+        if scheduler_state is None:
+            warnings.warn(
+                f"Checkpoint '{path}' has no scheduler state; resuming with a fresh scheduler.",
+                RuntimeWarning,
+            )
+        else:
+            scheduler.load_state_dict(scheduler_state)
+    if optimizer is not None and scaler is not None:
+        scaler_state = checkpoint.get("scaler_state_dict")
+        if scaler_state is not None:
+            scaler.load_state_dict(scaler_state)
 
     # Restore random states for reproducibility.
     # Skip when loading for inference (optimizer=None) — only model weights matter.

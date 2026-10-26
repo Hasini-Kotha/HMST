@@ -34,7 +34,7 @@ HMST solves this through a **three-scale hierarchical pipeline**:
                       └───────────────────────┼───────────────────────┘
                                               │
                                               ▼
-                             Shared ResNet-50 Backbone (§2.3)
+                      Shared ResNet-50 or ConvNeXt-Tiny Backbone
                            + Linear Projection → [B, N_s, 512]
                                               │
                       ┌───────────────────────┴───────────────────────┐
@@ -74,8 +74,8 @@ Input image $X \in \mathbb{R}^{B \times 3 \times 224 \times 224}$ is partitioned
 * **Coarse scale ($s_3, p=128$)**: $1 \times 1 = 1$ patch $[B, 1, 3, 128, 128]$ (centered crop). Captures global color cast, transmission haze, and background water illumination.
 
 ### 2. §4.3 Shared Feature Extraction & Local Quality Head
-All patches across all scales pass through a **shared ResNet-50 backbone** (ImageNet pretrained, truncated before the classification FC layer) followed by a linear projection:
-$$f_i^{(s)} = \text{Linear}(\text{ResNet50}(x_i^{(s)})) \in \mathbb{R}^{d}, \quad d = 512$$
+All patches across all scales pass through the selected, ImageNet-pretrained backbone, followed by a linear projection. ResNet-50 produces 2048 features; ConvNeXt-Tiny produces 768:
+$$f_i^{(s)} = \text{Linear}(\text{Backbone}(x_i^{(s)})) \in \mathbb{R}^{d}$$
 
 The **Local Quality Head** directly estimates an initial scalar quality score for each patch:
 $$q_i^{(s)} = \sigma(W_q f_i^{(s)} + b_q) \in [0, 1]$$
@@ -135,12 +135,12 @@ All required packages are specified in `requirements.txt`:
 ### 1. UWIQA Dataset
 * **Path**: `../UWIQA/UWIQA dataset/UWIQA/` (890 real underwater images).
 * **Ground Truth**: `../UWIQA/UWIQA dataset/IQA Value.xlsx` (MOS range: 0.2 – 1.0).
-* **Train / Val / Test Split**: 80% train (712 images), 20% test (178 images).
+* **Train / Val / Test Split**: seeded 80/20 train-candidate/test split, then 80/20 train/validation split within the train-candidate set (approximately 570/142/178 images).
 
 ### 2. SAUD Dataset
 * **Path**: `../SAUD/SAUD/Benchmark/Enhanced/` (1000 enhanced underwater images across 10 UIE algorithms).
-* **Ground Truth**: `../SAUD/SAUD/sub_bt_scores.mat` (Bradley-Terry preference scores normalized to $[0, 1]$).
-* **Train / Val / Test Split**: 80% train (800 images), 20% test (200 images).
+* **Ground Truth**: `../SAUD/SAUD/sub_bt_scores.mat` (Bradley-Terry preference scores scaled from training-split extrema).
+* **Train / Val / Test Split**: seeded 80/20 raw-scene split, then a raw-scene-disjoint 80/20 train/validation split within the training scenes (640/160/200 images when each of 100 scenes has 10 enhancements).
 
 ---
 
@@ -168,12 +168,8 @@ hmst/
 ├── scripts/
 │   ├── train.py           # Main training entry point
 │   └── evaluate.py        # Standalone checkpoint evaluation script
-├── checkpoints/           # Saved model weights (.pt files)
-│   ├── test/
-│   └── full/
-├── outputs/               # Training logs (history.csv, metrics.json)
-│   ├── test/
-│   └── full/
+├── checkpoints/           # Saved model weights, namespaced by dataset/mode/backbone
+├── outputs/               # Training logs, namespaced by dataset/mode/backbone
 └── requirements.txt       # Python environment dependencies
 ```
 
@@ -202,7 +198,7 @@ python scripts/train.py --mode test
 * **Purpose**: Verifies data loading, loss convergence, backward pass, checkpoint saving, and metric calculation.
 * **Hardware**: Runs safely on standard CPU or GPU.
 * **Runtime**: ~2 to 5 minutes.
-* **Outputs**: Checkpoints saved to `checkpoints/test/`, results to `outputs/test/test_metrics.json`.
+* **Outputs**: Checkpoints and logs are namespaced by dataset and mode; ConvNeXt outputs use `checkpoints/<dataset>/test/convnext/` and `outputs/<dataset>/test/convnext/`.
 
 ---
 
@@ -215,16 +211,25 @@ python scripts/train.py --mode full
 
 * **Purpose**: Full model convergence for research benchmark evaluation.
 * **Hardware**: Recommended on GPU (CUDA).
-* **Outputs**: Best checkpoint saved to `checkpoints/full/best.pt`, metrics saved to `outputs/full/test_metrics.json`.
+* **Outputs**: ConvNeXt on UWIQA saves to `checkpoints/uwiqa/full/convnext/` and `outputs/uwiqa/full/convnext/`; SAUD uses the corresponding `saud` paths. Start new runs with `resume: false`.
+
+For a custom full-run YAML, set `mode: full`, `dataset: uwiqa` or `saud`, and `backbone: convnext`; include the matching dataset path block and set `resume: false` for the first run. Relative dataset paths are resolved from the HMST project root; absolute server paths are also accepted.
+
+```powershell
+python scripts/train.py --config configs/my_uwiqa_full.yaml
+python scripts/train.py --config configs/my_saud_full.yaml
+```
 
 ---
 
 ### Step 4: Resume Interrupted Training
-If training was paused or stopped, resume seamlessly from the latest saved checkpoint:
+After a checkpoint exists, set `resume: true` in the same dataset-specific YAML and rerun:
 
 ```powershell
-python scripts/train.py --mode full --resume checkpoints/full/latest.pt
+python scripts/train.py --config configs/my_uwiqa_full.yaml
 ```
+
+The checkpoint is resolved under that dataset/mode/backbone directory. The script errors if the expected checkpoint is absent or if the checkpoint records another dataset. Use separate YAMLs for UWIQA and SAUD.
 
 ---
 
@@ -232,18 +237,25 @@ python scripts/train.py --mode full --resume checkpoints/full/latest.pt
 To evaluate any trained model checkpoint on the validation and test sets without retraining:
 
 ```powershell
-python scripts/evaluate.py --checkpoint checkpoints/full/best.pt --mode full
+python scripts/evaluate.py --checkpoint checkpoints/uwiqa/full/convnext/best.pt --mode full
 ```
 
 ---
 
 ## Evaluation & Metrics
 
-The pipeline evaluates predictions against human MOS scores using 4 standard IQA metrics:
-1. **PLCC (Pearson Linear Correlation Coefficient)** $\in [-1, 1]$ $\uparrow$: Measures prediction accuracy and linearity.
-2. **SROCC (Spearman Rank-Order Correlation Coefficient)** $\in [-1, 1]$ $\uparrow$: Measures monotonic ranking consistency (primary metric).
-3. **KRCC (Kendall Rank Correlation Coefficient)** $\in [-1, 1]$ $\uparrow$: Measures pairwise rank agreement.
-4. **RMSE (Root Mean Square Error)** $\in [0, \infty)$ $\downarrow$: Measures absolute prediction deviation.
+The pipeline evaluates predictions against human MOS scores using PLCC, SROCC,
+KRCC, and RMSE. Validation metrics retain the configured IQA 4-parameter
+logistic mapping for benchmark-style monitoring. Final test metrics report raw
+PLCC/RMSE as the primary values; JSON also records
+`same_split_fitted_plcc` and `same_split_fitted_rmse` for the 4-parameter fit
+performed on that same test split. Those fitted values are benchmark-style
+statistics, not out-of-sample calibration or raw deployment performance.
+
+* **PLCC (Pearson Linear Correlation Coefficient)** $\in [-1, 1]$ $\uparrow$: Measures prediction accuracy and linearity.
+* **SROCC (Spearman Rank-Order Correlation Coefficient)** $\in [-1, 1]$ $\uparrow$: Measures monotonic ranking consistency.
+* **KRCC (Kendall Rank Correlation Coefficient)** $\in [-1, 1]$ $\uparrow$: Measures pairwise rank agreement.
+* **RMSE (Root Mean Square Error)** $\in [0, \infty)$ $\downarrow$: Measures absolute prediction deviation.
 
 ---
 

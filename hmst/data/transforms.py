@@ -18,6 +18,7 @@ def get_train_transforms(
     hflip_p: float = 0.5,
     vflip_p: float = 0.5,
     degrees: float = 10.0,
+    color_jitter: float = 0.0,
 ) -> T.Compose:
     """
     Training transforms.
@@ -30,6 +31,12 @@ def get_train_transforms(
         transforms.append(T.RandomVerticalFlip(p=vflip_p))
     if degrees > 0:
         transforms.append(T.RandomRotation(degrees=degrees))
+    if color_jitter > 0:
+        transforms.append(T.ColorJitter(
+            brightness=color_jitter,
+            contrast=color_jitter,
+            saturation=color_jitter,
+        ))
     transforms.extend([
         T.ToTensor(),
         T.Normalize(

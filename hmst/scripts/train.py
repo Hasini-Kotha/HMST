@@ -34,6 +34,7 @@ from data import (
     SAUDDataset,
     make_uwiqa_splits,
     make_saud_splits,
+    split_saud_train_validation,
     get_train_transforms,
     get_val_transforms,
 )
@@ -109,21 +110,53 @@ def validate_training_config(config: dict, cfg_path: str) -> None:
     if not isinstance(config, dict):
         raise ValueError(f"Configuration file '{cfg_path}' must contain a valid YAML dictionary.")
 
-    # 1. Dataset
+    # 1. Dataset and mode
     if "dataset" not in config or not config["dataset"]:
         raise ValueError(f"Missing required key 'dataset' in config '{cfg_path}'.")
+    if config["dataset"] not in ("uwiqa", "saud", "uied"):
+        raise ValueError(
+            f"Unsupported dataset '{config['dataset']}' in config '{cfg_path}'. "
+            "Expected one of: uwiqa, saud, uied."
+        )
+    if config.get("mode", "full") not in ("test", "full"):
+        raise ValueError(f"Invalid 'mode' in config '{cfg_path}': expected 'test' or 'full'.")
+    if "resume" in config and type(config["resume"]) is not bool:
+        raise ValueError(f"Invalid 'resume' in config '{cfg_path}': expected true or false.")
 
-    # 2. Batch size (strict check - no silent fallbacks)
+    # 2. Active dataset settings
+    dataset_config = config.get(config["dataset"])
+    if not isinstance(dataset_config, dict):
+        raise ValueError(
+            f"Missing or invalid '{config['dataset']}' block in config '{cfg_path}'."
+        )
+    required_dataset_paths = {
+        "uwiqa": ("image_dir", "score_file"),
+        "saud": ("benchmark_dir", "bt_scores_mat"),
+        "uied": ("image_dir", "score_file"),
+    }[config["dataset"]]
+    for key in required_dataset_paths:
+        if not isinstance(dataset_config.get(key), str) or not dataset_config[key].strip():
+            raise ValueError(
+                f"Missing or invalid '{config['dataset']}.{key}' in config '{cfg_path}'."
+            )
+
+    # 3. Batch size (strict check - no silent fallbacks)
     batch_size = config.get("batch_size")
     if batch_size is None:
         raise ValueError(
             f"Missing required key 'batch_size' in config '{cfg_path}'. "
             f"Silent fallback is disabled to prevent experimental inconsistency."
         )
-    if not isinstance(batch_size, int) or batch_size <= 0:
+    if type(batch_size) is not int or batch_size <= 0:
         raise ValueError(f"Invalid 'batch_size' in config '{cfg_path}': expected positive integer, got {batch_size}.")
+    epochs = config.get("epochs", 50)
+    num_workers = config.get("num_workers", 0)
+    if type(epochs) is not int or epochs <= 0:
+        raise ValueError(f"Invalid 'epochs' in config '{cfg_path}': expected positive integer.")
+    if type(num_workers) is not int or num_workers < 0:
+        raise ValueError(f"Invalid 'num_workers' in config '{cfg_path}': expected non-negative integer.")
 
-    # 3. Optimizer
+    # 4. Optimizer
     opt_cfg = config.get("optimizer")
     if not isinstance(opt_cfg, dict):
         raise ValueError(f"Missing or invalid 'optimizer' block in config '{cfg_path}'. Expected dictionary.")
@@ -145,7 +178,26 @@ def validate_training_config(config: dict, cfg_path: str) -> None:
         except (TypeError, ValueError):
             raise ValueError(f"Invalid 'optimizer.weight_decay' in config '{cfg_path}': must be >= 0.")
 
-    # 4. Loss
+    # 5. Model dimensions
+    image_size = config.get("image_size", 224)
+    patch_sizes = config.get("patch_sizes", [32, 64, 128])
+    d_model = config.get("d_model", 512)
+    nhead = config.get("nhead", 8)
+    if type(image_size) is not int or image_size <= 0:
+        raise ValueError(f"Invalid 'image_size' in config '{cfg_path}': expected positive integer.")
+    if (not isinstance(patch_sizes, list) or len(patch_sizes) != 3
+            or any(type(size) is not int or size <= 0 or size > image_size for size in patch_sizes)):
+        raise ValueError(
+            f"Invalid 'patch_sizes' in config '{cfg_path}': expected three positive "
+            "integers no larger than image_size."
+        )
+    if type(d_model) is not int or type(nhead) is not int or d_model <= 0 or nhead <= 0 or d_model % nhead:
+        raise ValueError(
+            f"Invalid model dimensions in config '{cfg_path}': d_model must be a positive "
+            "multiple of nhead."
+        )
+
+    # 6. Loss
     loss_cfg = config.get("loss", {})
     if not isinstance(loss_cfg, dict):
         raise ValueError(f"Invalid 'loss' block in config '{cfg_path}': expected dictionary.")
@@ -184,18 +236,54 @@ def make_absolute(path: str, base: str) -> str:
     return resolved
 
 
+def validate_dataset_paths(config: dict, project_root: str, cfg_path: str) -> None:
+    """Fail before model construction when the active dataset paths are absent."""
+    dataset = config["dataset"]
+    dataset_config = config[dataset]
+    path_keys = {
+        "uwiqa": ("image_dir", "score_file"),
+        "saud": ("benchmark_dir", "bt_scores_mat"),
+        "uied": ("image_dir", "score_file"),
+    }[dataset]
+    for key in path_keys:
+        resolved = make_absolute(dataset_config[key], project_root)
+        expected_kind = (
+            os.path.isdir(resolved)
+            if key in ("image_dir", "benchmark_dir")
+            else os.path.isfile(resolved)
+        )
+        if not expected_kind:
+            expected = "directory" if key in ("image_dir", "benchmark_dir") else "file"
+            raise FileNotFoundError(
+                f"Configured path '{dataset}.{key}' from '{cfg_path}' is not an existing "
+                f"{expected}: "
+                f"{resolved}"
+            )
+        dataset_config[key] = resolved
+
+
 def dataset_output_dir(dataset: str, mode: str, project_root: str, iter_suffix: str = "", backbone: str = "resnet50") -> str:
-    """Dataset-scoped output directory. ResNet-50 preserves existing outputs/{dataset}/{mode}{iter_suffix}."""
+    """Keep outputs dataset/mode-scoped and isolate backbone runs below that path."""
     if backbone == "resnet50":
         return make_absolute(f"outputs/{dataset}/{mode}{iter_suffix}", project_root)
-    return make_absolute(f"outputs/{dataset}_{backbone}/{mode}{iter_suffix}", project_root)
+    return make_absolute(f"outputs/{dataset}/{mode}/{backbone}{iter_suffix}", project_root)
 
 
 def dataset_checkpoint_dir(dataset: str, mode: str, project_root: str, iter_suffix: str = "", backbone: str = "resnet50") -> str:
-    """Dataset-scoped checkpoint directory. ResNet-50 preserves existing checkpoints/{dataset}/{mode}{iter_suffix}."""
+    """Keep checkpoints dataset/mode-scoped and isolate backbone runs below that path."""
     if backbone == "resnet50":
         return make_absolute(f"checkpoints/{dataset}/{mode}{iter_suffix}", project_root)
-    return make_absolute(f"checkpoints/{dataset}_{backbone}/{mode}{iter_suffix}", project_root)
+    return make_absolute(f"checkpoints/{dataset}/{mode}/{backbone}{iter_suffix}", project_root)
+
+
+def legacy_dataset_checkpoint_dir(dataset: str, mode: str, project_root: str, iter_suffix: str = "", backbone: str = "resnet50") -> Optional[str]:
+    """Return the pre-dataset/mode/backbone ConvNeXt checkpoint directory, if applicable."""
+    if backbone == "resnet50":
+        return None
+    return make_absolute(
+        f"checkpoints/{dataset}_{backbone}/{mode}{iter_suffix}",
+        project_root,
+    )
 
 
 def write_run_marker(directory: str, dataset: str, mode: str, backbone: str = "resnet50") -> None:
@@ -451,6 +539,7 @@ def build_datasets(config: dict, project_root: str):
         hflip_p    = aug_cfg.get("horizontal_flip", 0.5),
         vflip_p    = aug_cfg.get("vertical_flip", 0.5),
         degrees    = aug_cfg.get("rotation", 10.0),
+        color_jitter = aug_cfg.get("color_jitter", 0.0),
     )
     val_tf   = get_val_transforms(image_size)
 
@@ -482,13 +571,22 @@ def build_datasets(config: dict, project_root: str):
 
         train_idx, test_idx = make_saud_splits(bt_mat, seed=seed)
 
-        val_size  = max(1, len(train_idx) // 5)
-        val_idx   = train_idx[-val_size:]
-        train_idx = train_idx[:-val_size]
+        train_idx, val_idx = split_saud_train_validation(
+            bt_mat, train_idx, seed=seed + 1
+        )
 
-        train_ds = SAUDDataset(benchmark_dir, bt_mat, train_idx, train_tf, max_train)
-        val_ds   = SAUDDataset(benchmark_dir, bt_mat, val_idx,   val_tf,   max_val)
-        test_ds  = SAUDDataset(benchmark_dir, bt_mat, test_idx,  val_tf,   max_test)
+        train_ds = SAUDDataset(
+            benchmark_dir, bt_mat, train_idx, train_tf, max_train,
+            score_range_indices=train_idx,
+        )
+        val_ds   = SAUDDataset(
+            benchmark_dir, bt_mat, val_idx, val_tf, max_val,
+            score_range_indices=train_idx,
+        )
+        test_ds  = SAUDDataset(
+            benchmark_dir, bt_mat, test_idx, val_tf, max_test,
+            score_range_indices=train_idx,
+        )
 
     elif dataset_name == "uied":
         cfg = config["uied"]
@@ -578,17 +676,16 @@ def main():
         cfg_path = resolve_config_path(args.config, project_root)
         with open(cfg_path, "r") as f:
             config = yaml.safe_load(f)
-        validate_training_config(config, cfg_path)
-        print(f"\n[Config] Successfully loaded and validated custom config: {cfg_path}")
     else:
         config = load_config(args.mode)
         cfg_path = os.path.normpath(os.path.join(project_root, "configs", f"{args.mode}.yaml"))
-        validate_training_config(config, cfg_path)
+    if not isinstance(config, dict):
+        raise ValueError(f"Configuration file '{cfg_path}' must contain a YAML dictionary.")
     if args.dataset:
         config["dataset"] = args.dataset
 
-    mode = config.get("mode", args.mode or "full")
-    dataset = config.get("dataset", "uwiqa")
+    if isinstance(config, dict) and isinstance(config.get("dataset"), str):
+        config["dataset"] = config["dataset"].lower().strip()
 
     # ── Determine backbone: CLI flag > config value > default 'resnet50' ───
     cli_backbone = args.backbone
@@ -610,14 +707,18 @@ def main():
     config["backbone"] = selected_backbone
     backbone = selected_backbone
 
+    if isinstance(config, dict):
+        config.setdefault("mode", args.mode)
+    validate_training_config(config, cfg_path)
+    mode = config["mode"]
+    dataset = config["dataset"]
+    validate_dataset_paths(config, project_root, cfg_path)
+    if args.config:
+        print(f"\n[Config] Successfully loaded and validated custom config: {cfg_path}")
+
     # Override resume from CLI
-    resume_path = args.resume
-    if resume_path is None and config.get("resume", False):
-        default_resume_dir = dataset_checkpoint_dir(dataset, mode, project_root, backbone=backbone)
-        assert_dataset_matches(default_resume_dir, dataset, backbone=backbone)
-        default_resume = os.path.join(default_resume_dir, "latest.pt")
-        if os.path.exists(default_resume):
-            resume_path = default_resume
+    if args.resume is not None and not os.path.isfile(args.resume):
+        raise FileNotFoundError(f"Requested resume checkpoint does not exist: {args.resume}")
 
     # ── Iterations Loop ───────────────────────────────────────────────────
     num_iterations = getattr(args, "iterations", 1)
@@ -651,11 +752,41 @@ def main():
         iter_suffix = f"_iter{it+1}" if num_iterations > 1 else ""
         checkpoint_dir = dataset_checkpoint_dir(dataset, mode, project_root, iter_suffix, backbone=backbone)
         output_dir = dataset_output_dir(dataset, mode, project_root, iter_suffix, backbone=backbone)
+        iter_resume_path = None
+        if args.resume and it == 0:
+            iter_resume_path = args.resume
+        elif config.get("resume", False):
+            default_iter_resume = os.path.join(checkpoint_dir, "latest.pt")
+            if not os.path.isfile(default_iter_resume):
+                legacy_dir = legacy_dataset_checkpoint_dir(
+                    dataset, mode, project_root, iter_suffix, backbone
+                )
+                legacy_resume = (
+                    os.path.join(legacy_dir, "latest.pt")
+                    if legacy_dir is not None else None
+                )
+                if legacy_resume is not None and os.path.isfile(legacy_resume):
+                    assert_dataset_matches(legacy_dir, dataset, backbone=backbone)
+                    iter_resume_path = legacy_resume
+                    print(
+                        f"[Trainer] Resuming legacy checkpoint; subsequent checkpoints "
+                        f"will be saved under {checkpoint_dir}"
+                    )
+                else:
+                    raise FileNotFoundError(
+                        "resume is true, but no latest checkpoint exists for "
+                        f"dataset='{dataset}', mode='{mode}', backbone='{backbone}': "
+                        f"{default_iter_resume}"
+                    )
+            else:
+                iter_resume_path = default_iter_resume
+
         # Hard-fail if either dir was previously owned by a different dataset or backbone.
         assert_dataset_matches(checkpoint_dir, dataset, backbone=backbone)
         assert_dataset_matches(output_dir, dataset, backbone=backbone)
         write_run_marker(checkpoint_dir, dataset, mode, backbone=backbone)
         write_run_marker(output_dir, dataset, mode, backbone=backbone)
+        config["checkpoint_dir"] = checkpoint_dir
         final_path = os.path.join(output_dir, "test_metrics.json")
         std_path = os.path.join(output_dir, "test_metrics_no_tta.json")
 
@@ -873,38 +1004,41 @@ def main():
         model.print_shapes = False
 
         # ── Train ─────────────────────────────────────────────────────────────
-        iter_resume_path = None
-        if config.get("resume", False):
-            default_iter_resume = os.path.join(checkpoint_dir, "latest.pt")
-            if os.path.exists(default_iter_resume):
-                iter_resume_path = default_iter_resume
-                
-        if args.resume and it == 0:
-            iter_resume_path = args.resume
-
         trainer.fit(train_loader, val_loader, resume_path=iter_resume_path)
 
         # ── Final test evaluation ─────────────────────────────────────────────
         print(f"\n{'='*60}")
         print(f"Final evaluation on test set for iteration {it+1}...")
-        from training.metrics import compute_metrics, collect_predictions, collect_predictions_tta
+        from training.metrics import (
+            compute_metrics,
+            compute_test_metrics,
+            collect_predictions,
+            collect_predictions_tta,
+        )
 
         best_ckpt_path = os.path.join(checkpoint_dir, "best.pt")
         best_epoch = None
         if os.path.exists(best_ckpt_path):
             from training.checkpoint import load_checkpoint
-            best_ckpt = load_checkpoint(best_ckpt_path, model, device=device)
+            best_ckpt = load_checkpoint(
+                best_ckpt_path,
+                model,
+                device=device,
+                expected_dataset=dataset,
+            )
             best_epoch = best_ckpt.get("epoch")
             print(f"Loaded best.pt for final evaluation (epoch {best_epoch})")
 
         # ── Standard single-pass evaluation ───────────────────────────────────
         result = collect_predictions(model, test_loader, device)
-        final_metrics = compute_metrics(result["predictions"], result["targets"])
+        final_metrics = compute_test_metrics(result["predictions"], result["targets"])
 
         # ── TTA evaluation (4-view flip average) ──────────────────────────────
         print(f"Running TTA evaluation (4 flip views)...")
         result_tta = collect_predictions_tta(model, test_loader, device)
-        final_metrics_tta = compute_metrics(result_tta["predictions"], result_tta["targets"])
+        final_metrics_tta = compute_test_metrics(
+            result_tta["predictions"], result_tta["targets"]
+        )
 
         if dataset in {"uwiqa", "saud"}:
             validation_result_tta = collect_predictions_tta(model, val_loader, device)
@@ -1019,12 +1153,20 @@ def main():
                 ])
 
         print(f"\nTest Set Results (Iter {it+1}):")
-        print(f"  {'Metric':<8}  {'No TTA':>8}  {'TTA (4-view)':>12}")
+        print(f"  {'Raw metric':<12}  {'No TTA':>8}  {'TTA (4-view)':>12}")
         print(f"  {'-'*34}")
-        print(f"  {'PLCC':<8}  {final_metrics['plcc']:>8.4f}  {final_metrics_tta['plcc']:>12.4f}")
+        print(f"  {'PLCC':<12}  {final_metrics['plcc']:>8.4f}  {final_metrics_tta['plcc']:>12.4f}")
         print(f"  {'SROCC':<8}  {final_metrics['srocc']:>8.4f}  {final_metrics_tta['srocc']:>12.4f}")
         print(f"  {'KRCC':<8}  {final_metrics['krcc']:>8.4f}  {final_metrics_tta['krcc']:>12.4f}")
         print(f"  {'RMSE':<8}  {final_metrics['rmse']:>8.4f}  {final_metrics_tta['rmse']:>12.4f}")
+        print(
+            "  Same-split 4PL fit (not out-of-sample): "
+            f"PLCC={final_metrics['same_split_fitted_plcc']:.4f}/"
+            f"{final_metrics_tta['same_split_fitted_plcc']:.4f}, "
+            f"RMSE={final_metrics['same_split_fitted_rmse']:.4f}/"
+            f"{final_metrics_tta['same_split_fitted_rmse']:.4f} "
+            "(No TTA/TTA)"
+        )
         print(f"TTA results saved to: {final_path}")
         print(f"Per-image predictions saved to: {pred_csv_path}")
 

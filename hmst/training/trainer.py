@@ -198,13 +198,26 @@ class HMSTTrainer:
             resume_path:  Optional path to a checkpoint to resume from
         """
         # ── Resume from checkpoint ─────────────────────────────────────────
-        if resume_path and Path(resume_path).exists():
+        if resume_path:
+            if not Path(resume_path).is_file():
+                raise FileNotFoundError(f"Resume checkpoint does not exist: {resume_path}")
             print(f"\n[Trainer] Resuming from: {resume_path}")
-            ckpt = load_checkpoint(resume_path, self.model, self.optimizer, self.device)
+            ckpt = load_checkpoint(
+                resume_path,
+                self.model,
+                self.optimizer,
+                self.device,
+                scheduler=self.scheduler,
+                scaler=self.scaler,
+                expected_dataset=self.config.get("dataset"),
+            )
             self.start_epoch = ckpt["epoch"] + 1
             default_best = -float("inf") if self.save_mode == "max" else float("inf")
             self.best_metric = ckpt.get("best_metric", default_best)
-            self.best_es_metric = self.best_metric  # Approximate sync on resume
+            trainer_state = ckpt.get("trainer_state", {})
+            default_es_best = -float("inf") if self.es_mode == "max" else float("inf")
+            self.best_es_metric = trainer_state.get("best_es_metric", default_es_best)
+            self.es_counter = trainer_state.get("es_counter", 0)
             self.training_history = ckpt.get("training_history", [])
             print(f"[Trainer] Continuing from epoch {self.start_epoch}")
         else:
@@ -272,13 +285,6 @@ class HMSTTrainer:
                 f"Time: {epoch_time:.1f}s"
             )
 
-            # ── Save latest checkpoint ─────────────────────────────────────
-            self._save_ckpt("latest.pt", epoch)
-
-            # ── Save epoch checkpoint (test mode) ─────────────────────────
-            if save_every:
-                self._save_ckpt(f"epoch_{epoch+1:03d}.pt", epoch)
-
             # ── Save best checkpoint ───────────────────────────────────────
             is_best = False
             if self.save_mode == "max":
@@ -290,7 +296,6 @@ class HMSTTrainer:
                     
             if is_best:
                 self.best_metric = ckpt_val
-                self._save_ckpt("best.pt", epoch)
                 print(f"  → New best {self.save_monitor.upper()}: {self.best_metric:.4f} — saved best.pt")
 
             # ── Early Stopping ─────────────────────────────────────────────
@@ -310,7 +315,16 @@ class HMSTTrainer:
                 self.es_counter += 1
                 print(f"  → {self.es_monitor.upper()} did not improve. Patience: {self.es_counter}/{self.es_patience}")
                 
-            if self.es_counter >= self.es_patience and (epoch + 1) >= self.min_epochs:
+            should_stop = self.es_counter >= self.es_patience and (epoch + 1) >= self.min_epochs
+
+            # Save after updating best/early-stopping state so interruption resumes exactly.
+            if is_best:
+                self._save_ckpt("best.pt", epoch)
+            self._save_ckpt("latest.pt", epoch)
+            if save_every:
+                self._save_ckpt(f"epoch_{epoch+1:03d}.pt", epoch)
+
+            if should_stop:
                 print(f"\n[Trainer] Early stopping triggered after {epoch + 1} epochs!")
                 break
 
@@ -335,6 +349,12 @@ class HMSTTrainer:
             best_metric=self.best_metric,
             training_history=self.training_history,
             config=self.config,
+            scheduler=self.scheduler,
+            scaler=self.scaler,
+            trainer_state={
+                "best_es_metric": self.best_es_metric,
+                "es_counter": self.es_counter,
+            },
         )
 
     def _write_history(self) -> None:
