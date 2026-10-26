@@ -144,6 +144,18 @@ def compute_metrics(
     }
 
 
+def compute_test_metrics(
+    predictions: np.ndarray,
+    targets: np.ndarray,
+) -> Dict[str, float]:
+    """Return raw test metrics and explicitly labeled same-test 4PL metrics."""
+    metrics = compute_metrics(predictions, targets, use_nonlinear_fit=False)
+    fitted_metrics = compute_metrics(predictions, targets, use_nonlinear_fit=True)
+    metrics["same_split_fitted_plcc"] = fitted_metrics["plcc"]
+    metrics["same_split_fitted_rmse"] = fitted_metrics["rmse"]
+    return metrics
+
+
 def collect_predictions(
     model: torch.nn.Module,
     dataloader: torch.utils.data.DataLoader,

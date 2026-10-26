@@ -67,7 +67,9 @@ class MultiScalePatchExtractor(nn.Module):
         for ps, gs in zip(self.patch_sizes, self.grid_sizes):
             # Crop to the largest multiple of ps that fits
             crop = gs * ps  # e.g. 7*32=224, 3*64=192, 1*128=128
-            x_crop = x[:, :, :crop, :crop]  # [B, C, crop, crop]
+            top = (H - crop) // 2
+            left = (W - crop) // 2
+            x_crop = x[:, :, top:top + crop, left:left + crop]
 
             # unfold: extract non-overlapping ps×ps patches
             # Result shape: [B, C, gs, ps, gs, ps]
@@ -241,19 +243,20 @@ class HierarchicalPooling(nn.Module):
         Returns list of lists of patch indices.
         """
         n_r = self.n_regions
-        # Compute how many grid cells per region block
-        # n_r must be a perfect square for even spatial coverage
+        # n_r must be a perfect square for an even spatial partition.
         r_side = max(1, int(math.isqrt(n_r)))
-        # clamp n_r so it divides the grid evenly
         r_side = min(r_side, grid_size)
-        cell_size = max(1, grid_size // r_side)
 
         groups = []
         for ri in range(r_side):
             for rj in range(r_side):
                 patch_indices = []
-                for pi in range(ri * cell_size, min((ri + 1) * cell_size, grid_size)):
-                    for pj in range(rj * cell_size, min((rj + 1) * cell_size, grid_size)):
+                row_start = ri * grid_size // r_side
+                row_end = (ri + 1) * grid_size // r_side
+                col_start = rj * grid_size // r_side
+                col_end = (rj + 1) * grid_size // r_side
+                for pi in range(row_start, row_end):
+                    for pj in range(col_start, col_end):
                         patch_indices.append(pi * grid_size + pj)
                 if patch_indices:
                     groups.append(patch_indices)
@@ -327,7 +330,7 @@ class ScaleAdaptiveFusion(nn.Module):
     G_s = global representation of scale s (mean of all patch features)
     e_s = MLP(G_s)
     λ_s = softmax(e_s)
-    Q̂   = Σ_s λ_s · Σ_i α_i^(s) · q_i^(s)
+    Q̂   = Σ_s λ_s · Q_s, where Q_s is the hierarchical image score
 
     Args:
         d_model:   Feature dimension
@@ -346,14 +349,12 @@ class ScaleAdaptiveFusion(nn.Module):
     def forward(
         self,
         scale_features:  List[torch.Tensor],  # [B, Ns, D] per scale
-        scale_alphas:    List[torch.Tensor],  # [B, Ns, 1] per scale
-        scale_qualities: List[torch.Tensor],  # [B, Ns, 1] per scale
+        scale_scores:    List[torch.Tensor],  # [B] hierarchical score per scale
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             scale_features:  list of [B, Ns, D] — Transformer outputs h_i
-            scale_alphas:    list of [B, Ns, 1] — importance weights α_i
-            scale_qualities: list of [B, Ns, 1] — local qualities q_i
+            scale_scores:    list of [B] — hierarchical image score per scale
 
         Returns:
             Q_hat:       [B] — final fused quality score
@@ -365,18 +366,12 @@ class ScaleAdaptiveFusion(nn.Module):
 
         for s in range(S):
             h_s = scale_features[s]    # [B, Ns, D]
-            alpha_s = scale_alphas[s]  # [B, Ns, 1]
-            q_s = scale_qualities[s]   # [B, Ns, 1]
-
             # G_s = global mean of patch features → drives scale attention
             G_s = h_s.mean(dim=1)      # [B, D]
             e_s = self.scale_mlp(G_s)  # [B, 1]
             e_s_list.append(e_s)
 
-            # Per-scale quality score: weighted sum of patch qualities
-            # Q_s = Σ_i α_i · q_i
-            Q_s = (alpha_s * q_s).sum(dim=1)  # [B, 1]
-            Q_s_list.append(Q_s)
+            Q_s_list.append(scale_scores[s].unsqueeze(1))
 
         e_s_t = torch.cat(e_s_list, dim=1)    # [B, S]
         lambda_s = F.softmax(e_s_t, dim=1)    # [B, S]

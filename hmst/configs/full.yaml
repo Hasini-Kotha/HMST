@@ -69,7 +69,7 @@ loss:
 # ── Checkpointing ────────────────────────────────────────────
 checkpoint_dir: checkpoints/full
 save_every_epoch: false  # Only save latest + best on server
-resume: true
+resume: false  # Set true only when this dataset/mode already has latest.pt.
 
 checkpoint:
   save_best_on: srocc    # Fixed: Ensures we save the highest SROCC model

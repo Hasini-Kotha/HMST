@@ -36,7 +36,7 @@ Architecture flow:
           │
     §4.8  Scale-Adaptive Fusion
           λ_s = softmax(MLP(G_s))
-          Q̂   = Σ_s λ_s · Σ_i α_i^(s) · q_i^(s)
+          Q̂   = Σ_s λ_s · Q_s, using the hierarchical per-scale quality Q_s
           │
     §4.9  Cross-Scale Consistency Loss (training only)
           L_cons = Σ_{i,j} M_ij · (q_i^(32) - q_j^(128))²
@@ -310,8 +310,7 @@ class HMST(nn.Module):
         # ── §4.8  Scale-Adaptive Fusion ────────────────────────────────────
         Q_hat, lambda_s = self.scale_fusion(
             scale_features=scale_features,
-            scale_alphas=scale_alphas,
-            scale_qualities=scale_qualities,
+            scale_scores=Q_image_per_scale,
         )
 
         if dbg:

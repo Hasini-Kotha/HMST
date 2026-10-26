@@ -65,6 +65,7 @@ from data import (
     SAUDDataset,
     make_uwiqa_splits,
     make_saud_splits,
+    split_saud_train_validation,
     get_train_transforms,
     get_val_transforms,
 )
@@ -161,9 +162,9 @@ class Objective:
             self.train_idx, self.test_idx = make_saud_splits(
                 self.bt_mat, seed=args.seed
             )
-            val_size = max(1, len(self.train_idx) // 5)
-            self.val_idx = self.train_idx[-val_size:]
-            self.train_idx = self.train_idx[:-val_size]
+            self.train_idx, self.val_idx = split_saud_train_validation(
+                self.bt_mat, self.train_idx, seed=args.seed + 1
+            )
         else:
             raise ValueError(f"Unsupported dataset: {self.dataset_name}")
 
@@ -234,8 +235,20 @@ class Objective:
             train_ds = UWIQADataset(self.image_dir, self.score_file, self.train_idx, train_tf)
             val_ds = UWIQADataset(self.image_dir, self.score_file, self.val_idx, val_tf)
         else:
-            train_ds = SAUDDataset(self.benchmark_dir, self.bt_mat, self.train_idx, train_tf)
-            val_ds = SAUDDataset(self.benchmark_dir, self.bt_mat, self.val_idx, val_tf)
+            train_ds = SAUDDataset(
+                self.benchmark_dir,
+                self.bt_mat,
+                self.train_idx,
+                train_tf,
+                score_range_indices=self.train_idx,
+            )
+            val_ds = SAUDDataset(
+                self.benchmark_dir,
+                self.bt_mat,
+                self.val_idx,
+                val_tf,
+                score_range_indices=self.train_idx,
+            )
 
         pin_mem = self.device.type == "cuda"
         num_workers = self.args.workers

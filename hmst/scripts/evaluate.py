@@ -36,7 +36,12 @@ from scripts.train import (
 from models import HMST, build_correspondence_matrix
 from models.losses import HMSTLoss
 from training.checkpoint import load_checkpoint
-from training.metrics import compute_metrics, collect_predictions, collect_predictions_tta
+from training.metrics import (
+    compute_metrics,
+    compute_test_metrics,
+    collect_predictions,
+    collect_predictions_tta,
+)
 from training.plots import save_error_analysis_plots, save_quality_plots
 
 
@@ -171,13 +176,14 @@ def main():
     # Evaluate on val and test
     plot_results = {}
     for split_name, loader in [("Validation", val_loader), ("Test", test_loader)]:
+        metric_fn = compute_test_metrics if split_name == "Test" else compute_metrics
         # Standard single-pass evaluation
         result = collect_predictions(model, loader, device)
-        metrics = compute_metrics(result["predictions"], result["targets"])
+        metrics = metric_fn(result["predictions"], result["targets"])
 
         # TTA evaluation (4-view flip average)
         result_tta = collect_predictions_tta(model, loader, device)
-        metrics_tta = compute_metrics(result_tta["predictions"], result_tta["targets"])
+        metrics_tta = metric_fn(result_tta["predictions"], result_tta["targets"])
         plot_results[split_name.lower()] = (result, result_tta, metrics_tta)
 
         # Per-image absolute errors (TTA + no-TTA) -> MAE / MedAE
@@ -196,12 +202,23 @@ def main():
         metrics.update({"mae": mae_no_tta, "medae": medae_no_tta})
 
         print(f"\n{split_name} Metrics (n={len(result['predictions'])}):")
-        print(f"  {'Metric':<8}  {'No TTA':>8}  {'TTA (4-view)':>12}")
+        print(f"  {'Metric':<12}  {'No TTA':>8}  {'TTA (4-view)':>12}")
         print(f"  {'-'*34}")
-        print(f"  {'PLCC':<8}  {metrics['plcc']:>8.4f}  {metrics_tta['plcc']:>12.4f}")
+        plcc_label = "PLCC (raw)" if split_name == "Test" else "PLCC (4PL)"
+        rmse_label = "RMSE (raw)" if split_name == "Test" else "RMSE (4PL)"
+        print(f"  {plcc_label:<12}  {metrics['plcc']:>8.4f}  {metrics_tta['plcc']:>12.4f}")
         print(f"  {'SROCC':<8}  {metrics['srocc']:>8.4f}  {metrics_tta['srocc']:>12.4f}")
         print(f"  {'KRCC':<8}  {metrics['krcc']:>8.4f}  {metrics_tta['krcc']:>12.4f}")
-        print(f"  {'RMSE':<8}  {metrics['rmse']:>8.4f}  {metrics_tta['rmse']:>12.4f}")
+        print(f"  {rmse_label:<12}  {metrics['rmse']:>8.4f}  {metrics_tta['rmse']:>12.4f}")
+        if split_name == "Test":
+            print(
+                "  Same-split 4PL fit (not out-of-sample): "
+                f"PLCC={metrics['same_split_fitted_plcc']:.4f}/"
+                f"{metrics_tta['same_split_fitted_plcc']:.4f}, "
+                f"RMSE={metrics['same_split_fitted_rmse']:.4f}/"
+                f"{metrics_tta['same_split_fitted_rmse']:.4f} "
+                "(No TTA/TTA)"
+            )
         print(f"  {'MAE':<8}  {mae_no_tta:>8.4f}  {mae_tta:>12.4f}")
         print(f"  {'MedAE':<8}  {medae_no_tta:>8.4f}  {medae_tta:>12.4f}")
 
