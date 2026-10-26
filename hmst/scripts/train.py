@@ -692,7 +692,6 @@ def main():
             json.dump(final_metrics, f, indent=2)
 
         # ── Per-image predictions CSV (Actual vs Predicted analysis) ──────────
-        import csv
         pred_csv_path = os.path.join(output_dir, "test_predictions.csv")
         paths = result_tta.get("paths", result.get("paths", []))
         preds_no_tta = result["predictions"]
